@@ -1,0 +1,28 @@
+# Gradle
+.gradle/
+build/
+!source/gradle/wrapper/gradle-wrapper.jar
+
+# Eclipse
+.project
+.classpath
+.settings/
+bin/
+
+# IntelliJ
+.idea/
+*.iml
+*.iws
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Claude Code session/tooling state (not project source)
+.claude/
