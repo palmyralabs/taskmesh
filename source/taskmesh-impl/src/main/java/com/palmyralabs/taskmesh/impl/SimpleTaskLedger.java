@@ -2,7 +2,6 @@ package com.palmyralabs.taskmesh.impl;
 import com.palmyralabs.taskmesh.impl.entity.TaskId;
 import com.palmyralabs.taskmesh.impl.entity.TaskStatus;
 import com.palmyralabs.taskmesh.impl.entity.TmInFlightEntity;
-import com.palmyralabs.taskmesh.impl.entity.TmTaskEntity;
 import com.palmyralabs.taskmesh.impl.repository.TmInFlightRepository;
 import com.palmyralabs.taskmesh.impl.repository.TmTaskRepository;
 
@@ -25,12 +24,12 @@ import java.util.List;
 
 /**
  * Single-node {@code ClaimStrategy}/{@code TaskLedger} — no lease, no
- * affinity/reclaim/timeout (no cross-node race to arbitrate at all), per
- * {@code infra-implementations.md}'s Variant A. Retries reset the hot row to
- * unclaimed immediately rather than keeping a {@code RELEASED} affinity
- * window — there's no affinity concept here. Split across the cold
- * {@link TmTaskRepository} and hot {@link TmInFlightRepository} the same way
- * as {@link MultiNodeTaskLedger} — see {@link TmInFlightEntity}'s Javadoc.
+ * affinity/reclaim/timeout/reservation (no cross-node race to arbitrate at
+ * all), per {@code infra-implementations.md}'s Variant A. Retries reset the
+ * hot row to unclaimed immediately rather than keeping a {@code RELEASED}
+ * affinity window. Like {@link MultiNodeTaskLedger}, query/claim/release refer
+ * to the hot {@link TmInFlightRepository} exclusively; {@code tm_task} is
+ * written only at enqueue and (as a snapshot) on the terminal transition.
  * Node identity comes from the given {@link NodeInfoProvider} (D17).
  */
 @RequiredArgsConstructor
@@ -77,49 +76,65 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
     }
 
     private ReleaseOutcome terminalRelease(TaskRef taskRef, TaskStatus terminalStatus, ReleaseRequest request) {
+        // Lock the cold row FIRST — same order as enqueue (tm_task -> tm_in_flight) — to avoid a deadlock
+        // with a concurrent enqueue of the same task.
+        taskRepository.lockByPk(taskRef.taskType(), taskRef.taskId());
+        TmInFlightEntity hot = inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId())).orElse(null);
         int deleted = inFlightRepository.deleteOwned(taskRef.taskType(), taskRef.taskId(), nodeInfoProvider.nodeId());
-        if (deleted == 0) {
+        if (deleted == 0 || hot == null) {
             return ReleaseOutcome.LOST_OWNERSHIP;
         }
         taskRepository.terminalUpdate(taskRef.taskType(), taskRef.taskId(), terminalStatus,
-                request.reasonCode(), request.errorSummary(), Instant.now());
+                hot.getAttemptCount(), hot.getMaxAttempts(), request.reasonCode(), request.errorSummary(), Instant.now());
         return ReleaseOutcome.OK;
     }
 
     private ReleaseOutcome requeueRelease(TaskRef taskRef, ReleaseRequest request) {
         Instant now = Instant.now();
+        // Lock the cold row first (same rationale as terminalRelease) — the exhaustion branch writes tm_task.
+        taskRepository.lockByPk(taskRef.taskType(), taskRef.taskId());
         int fenced = inFlightRepository.resetUnclaimed(taskRef.taskType(), taskRef.taskId(), nodeInfoProvider.nodeId(), now);
         if (fenced == 0) {
             return ReleaseOutcome.LOST_OWNERSHIP;
         }
 
-        TmTaskEntity task = taskRepository.findForUpdate(taskRef.taskType(), taskRef.taskId())
-                .orElseThrow(() -> new IllegalStateException("tm_task row missing for " + taskRef + " despite a fenced hot-row release"));
-        int nextAttempt = task.getAttemptCount() + 1;
-        int effectiveMaxAttempts = Math.min(task.getMaxAttempts(), retryPolicy.maxAttempts());
-
-        task.setAttemptCount(nextAttempt);
-        task.setReasonCode(request.reasonCode());
-        task.setErrorSummary(request.errorSummary());
-        task.setUpdatedAt(now);
+        TmInFlightEntity hot = inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId()))
+                .orElseThrow(() -> new IllegalStateException("tm_in_flight row missing for " + taskRef + " despite a fenced hot-row release"));
+        int nextAttempt = hot.getAttemptCount() + 1;
+        int effectiveMaxAttempts = Math.min(hot.getMaxAttempts(), retryPolicy.maxAttempts());
 
         if (nextAttempt > effectiveMaxAttempts) {
-            task.setStatus(TaskStatus.FAILED);
-            task.setNextRetryAt(null);
-            taskRepository.save(task);
+            taskRepository.terminalUpdate(taskRef.taskType(), taskRef.taskId(), TaskStatus.FAILED,
+                    nextAttempt, hot.getMaxAttempts(), request.reasonCode(), request.errorSummary(), now);
             inFlightRepository.deleteByTaskTypeAndTaskId(taskRef.taskType(), taskRef.taskId());
             return ReleaseOutcome.EXHAUSTED;
         }
 
-        task.setStatus(TaskStatus.QUEUED);
-        task.setNextRetryAt(retryPolicy.nextRetryAt(nextAttempt));
-        taskRepository.save(task);
+        // Reset to unclaimed (resetUnclaimed above) plus the bumped counter and backoff gate — no affinity, so node stays cleared.
+        hot.setAttemptCount(nextAttempt);
+        hot.setNextRetryAt(retryPolicy.nextRetryAt(nextAttempt));
+        hot.setUpdatedAt(now);
+        inFlightRepository.save(hot);
         return ReleaseOutcome.OK;
     }
 
     @Override
     public List<TaskRef> pullPending(String taskType, Instant now, int limit) {
         return inFlightRepository.findClaimableSingleNode(taskType, now, PageRequest.of(0, limit));
+    }
+
+    /** Recreates the hot row and forces the cold row back to {@code QUEUED} in one transaction; no-op if the task was never enqueued. */
+    @Override
+    public void rerun(TaskRef taskRef) {
+        transactionTemplate.executeWithoutResult(status -> {
+            TaskId id = new TaskId(taskRef.taskType(), taskRef.taskId());
+            if (taskRepository.findById(id).isEmpty()) {
+                return;
+            }
+            inFlightRepository.deleteByTaskTypeAndTaskId(taskRef.taskType(), taskRef.taskId());
+            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId()));
+            taskRepository.forceRequeue(taskRef.taskType(), taskRef.taskId(), Instant.now());
+        });
     }
 
     @Override
@@ -129,7 +144,7 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
                 TaskId id = new TaskId(taskRef.taskType(), taskRef.taskId());
                 if (taskRepository.findById(id).isEmpty()) {
                     taskRepository.save(TmTaskEntities.newQueuedRow(taskRef));
-                    inFlightRepository.save(TmTaskEntities.newUnclaimedRow(taskRef));
+                    inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId()));
                 }
             });
         } catch (DataIntegrityViolationException e) {

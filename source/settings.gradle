@@ -1,3 +1,7 @@
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
 rootProject.name = 'taskmesh'
 
 include 'taskmesh-api'
@@ -5,3 +9,4 @@ include 'taskmesh-testkit'
 include 'taskmesh-engine'
 include 'taskmesh-impl'
 include 'taskmesh-spring-boot-starter'
+include 'taskmesh-integration-test'

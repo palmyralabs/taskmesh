@@ -47,7 +47,8 @@ final class ProfileFactories {
         }
         return new MultiNodeTaskLedger(taskRepository, inFlightRepository, transactionTemplate, nodeInfoProvider, retryPolicy,
                 Duration.ofSeconds(properties.getLeaseSeconds()), Duration.ofSeconds(properties.getReclaimSeconds()),
-                Duration.ofSeconds(properties.getAffinitySeconds()), Duration.ofSeconds(properties.getClaimTimeoutSeconds()));
+                Duration.ofSeconds(properties.getAffinitySeconds()), Duration.ofSeconds(properties.getClaimTimeoutSeconds()),
+                Duration.ofSeconds(properties.getReservationSeconds()));
     }
 
     static HeartbeatStrategy heartbeatStrategy(WorkloadProfile profile, TaskmeshProperties properties,

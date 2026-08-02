@@ -1,7 +1,7 @@
 package com.palmyralabs.taskmesh.impl;
 import com.palmyralabs.taskmesh.impl.entity.TaskId;
 import com.palmyralabs.taskmesh.impl.entity.TaskStatus;
-import com.palmyralabs.taskmesh.impl.entity.TmTaskEntity;
+import com.palmyralabs.taskmesh.impl.entity.TmInFlightEntity;
 import com.palmyralabs.taskmesh.impl.repository.TmInFlightRepository;
 import com.palmyralabs.taskmesh.impl.repository.TmTaskRepository;
 
@@ -24,15 +24,27 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * Multi-node {@code ClaimStrategy}/{@code TaskLedger}, the 3-window
- * (reclaim/affinity/timeout) model (D27), split across the cold
- * {@link TmTaskRepository} (enqueue + terminal/requeue) and the hot
- * {@link TmInFlightRepository} (claim/renew/release churn) — see
- * {@link TmInFlightEntity}'s Javadoc for why. {@code reclaimWindow} governs
- * only the timestamp-refresh write-minimization inside the claim UPDATE,
- * never eligibility — the palmyra76/workflow "60s-150s dead zone" lesson.
- * Node identity comes from the given {@link NodeInfoProvider} (D17); build
- * one instance per node.
+ * Multi-node {@code ClaimStrategy}/{@code TaskLedger}. Query/claim/release
+ * refer to the hot {@link TmInFlightRepository} exclusively — {@code tm_task}
+ * is written only at enqueue and, as a cold snapshot, on the terminal
+ * transition (where the final {@code attempt_count}/{@code max_attempts} are
+ * copied from the hot row before it's deleted).
+ *
+ * <p>Four windows govern eligibility, all keyed off the hot row:
+ * <ul>
+ *   <li>{@code reservationWindow} — a freshly enqueued {@code QUEUED} row is
+ *       reserved to the enqueuing node; another node may steal it only once
+ *       the row is older than this window (so a producer gets first crack at
+ *       its own work, but a crashed/overloaded producer never strands it).</li>
+ *   <li>{@code reclaimWindow} — governs only the {@code claimed_at} refresh
+ *       inside the claim UPDATE (write-minimization), never eligibility.</li>
+ *   <li>{@code affinityWindow} — a {@code RELEASED} row's last owner gets
+ *       first refusal on the re-claim.</li>
+ *   <li>{@code claimTimeout} — a {@code CLAIMED} row whose owner went silent
+ *       is presumed dead and stealable.</li>
+ * </ul>
+ * Node identity comes from the given {@link NodeInfoProvider} (D17); build one
+ * instance per node.
  */
 @RequiredArgsConstructor
 public class MultiNodeTaskLedger implements ClaimStrategy, TaskLedger {
@@ -46,13 +58,15 @@ public class MultiNodeTaskLedger implements ClaimStrategy, TaskLedger {
     private final Duration reclaimWindow;
     private final Duration affinityWindow;
     private final Duration claimTimeout;
+    private final Duration reservationWindow;
 
     @Override
     public ClaimOutcome claim(TaskRef taskRef) {
         Boolean won = transactionTemplate.execute(status -> {
             Instant now = Instant.now();
             int rows = inFlightRepository.claimMultiNode(taskRef.taskType(), taskRef.taskId(), nodeInfoProvider.nodeId(), now,
-                    now.minus(reclaimWindow), now.minus(affinityWindow), now.minus(claimTimeout), now.plus(leaseDuration));
+                    now.minus(reclaimWindow), now.minus(reservationWindow), now.minus(affinityWindow), now.minus(claimTimeout),
+                    now.plus(leaseDuration));
             return rows == 1;
         });
         return Boolean.TRUE.equals(won) ? ClaimOutcome.WON : ClaimOutcome.LOST;
@@ -77,63 +91,91 @@ public class MultiNodeTaskLedger implements ClaimStrategy, TaskLedger {
         });
     }
 
-    /** Fenced via the hot-row delete — 0 rows means ownership was already lost, so the cold row is never touched. */
+    /**
+     * Fenced via the hot-row delete — 0 rows means ownership was already lost,
+     * so the cold row is never touched. The hot row's final counters are read
+     * first and copied onto the cold snapshot (D-terminal-snapshot).
+     */
     private ReleaseOutcome terminalRelease(TaskRef taskRef, TaskStatus terminalStatus, ReleaseRequest request) {
+        // Lock the cold row FIRST — same order as enqueue (tm_task -> tm_in_flight) — so release and a
+        // concurrent enqueue of the same task can't deadlock on the two tables.
+        taskRepository.lockByPk(taskRef.taskType(), taskRef.taskId());
+        TmInFlightEntity hot = inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId())).orElse(null);
         int deleted = inFlightRepository.deleteOwned(taskRef.taskType(), taskRef.taskId(), nodeInfoProvider.nodeId());
-        if (deleted == 0) {
+        if (deleted == 0 || hot == null) {
             return ReleaseOutcome.LOST_OWNERSHIP;
         }
         taskRepository.terminalUpdate(taskRef.taskType(), taskRef.taskId(), terminalStatus,
-                request.reasonCode(), request.errorSummary(), Instant.now());
+                hot.getAttemptCount(), hot.getMaxAttempts(), request.reasonCode(), request.errorSummary(), Instant.now());
         return ReleaseOutcome.OK;
     }
 
     private ReleaseOutcome requeueRelease(TaskRef taskRef, ReleaseRequest request) {
         Instant now = Instant.now();
+        // Lock the cold row first (same rationale as terminalRelease) — the exhaustion branch writes tm_task.
+        taskRepository.lockByPk(taskRef.taskType(), taskRef.taskId());
         int fenced = inFlightRepository.markReleased(taskRef.taskType(), taskRef.taskId(), nodeInfoProvider.nodeId(), now);
         if (fenced == 0) {
             return ReleaseOutcome.LOST_OWNERSHIP;
         }
 
-        TmTaskEntity task = taskRepository.findForUpdate(taskRef.taskType(), taskRef.taskId())
-                .orElseThrow(() -> new IllegalStateException("tm_task row missing for " + taskRef + " despite a fenced hot-row release"));
-        int nextAttempt = task.getAttemptCount() + 1;
-        int effectiveMaxAttempts = Math.min(task.getMaxAttempts(), retryPolicy.maxAttempts());
-
-        task.setAttemptCount(nextAttempt);
-        task.setReasonCode(request.reasonCode());
-        task.setErrorSummary(request.errorSummary());
-        task.setUpdatedAt(now);
+        TmInFlightEntity hot = inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId()))
+                .orElseThrow(() -> new IllegalStateException("tm_in_flight row missing for " + taskRef + " despite a fenced hot-row release"));
+        int nextAttempt = hot.getAttemptCount() + 1;
+        int effectiveMaxAttempts = Math.min(hot.getMaxAttempts(), retryPolicy.maxAttempts());
 
         if (nextAttempt > effectiveMaxAttempts) {
-            task.setStatus(TaskStatus.FAILED);
-            task.setNextRetryAt(null);
-            taskRepository.save(task);
-            // Terminal — the hot row's just-set RELEASED state no longer means anything; drop it.
+            // Exhausted — snapshot the final counters onto the cold row, then drop the just-RELEASED hot row.
+            taskRepository.terminalUpdate(taskRef.taskType(), taskRef.taskId(), TaskStatus.FAILED,
+                    nextAttempt, hot.getMaxAttempts(), request.reasonCode(), request.errorSummary(), now);
             inFlightRepository.deleteByTaskTypeAndTaskId(taskRef.taskType(), taskRef.taskId());
             return ReleaseOutcome.EXHAUSTED;
         }
 
-        // node_id NOT cleared by markReleased — kept as "last owner" for the affinity window (D27).
-        task.setNextRetryAt(retryPolicy.nextRetryAt(nextAttempt));
-        taskRepository.save(task);
+        // Within budget — bump the counter and set the backoff gate on the hot row.
+        // node_id retained (RELEASED, from markReleased) so the affinity window has a key.
+        hot.setAttemptCount(nextAttempt);
+        hot.setNextRetryAt(retryPolicy.nextRetryAt(nextAttempt));
+        hot.setUpdatedAt(now);
+        inFlightRepository.save(hot);
         return ReleaseOutcome.OK;
     }
 
     @Override
     public List<TaskRef> pullPending(String taskType, Instant now, int limit) {
         return inFlightRepository.findClaimableMultiNode(taskType, nodeInfoProvider.nodeId(), now,
-                now.minus(affinityWindow), now.minus(claimTimeout), PageRequest.of(0, limit));
+                now.minus(reservationWindow), now.minus(affinityWindow), now.minus(claimTimeout), PageRequest.of(0, limit));
+    }
+
+    /**
+     * Recreates the hot claim row (a terminal outcome may have deleted it),
+     * reserved to this node, and forces the cold row back to {@code QUEUED} —
+     * all in one transaction. No-op if the task was never enqueued (keeps the
+     * cold/hot pair invariant intact). Forcibly resets even an in-progress
+     * task; the displaced worker's release then reports {@code LOST_OWNERSHIP}.
+     */
+    @Override
+    public void rerun(TaskRef taskRef) {
+        transactionTemplate.executeWithoutResult(status -> {
+            TaskId id = new TaskId(taskRef.taskType(), taskRef.taskId());
+            if (taskRepository.findById(id).isEmpty()) {
+                return;
+            }
+            inFlightRepository.deleteByTaskTypeAndTaskId(taskRef.taskType(), taskRef.taskId());
+            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId()));
+            taskRepository.forceRequeue(taskRef.taskType(), taskRef.taskId(), Instant.now());
+        });
     }
 
     /**
      * findById-then-save (both tables) is not atomic — two genuinely
      * concurrent callers for the same brand-new {@link TaskRef} can both
      * pass the empty check before either row exists, then collide on
-     * {@code tm_task}'s primary key. {@link InFlightSet} doesn't protect
-     * this path — {@code enqueue()} runs before that gate. Enqueue is
-     * documented as idempotent, so losing that race is not an error: the
-     * other caller's rows are exactly the outcome this call wanted too.
+     * {@code tm_task}'s primary key. {@link com.palmyralabs.taskmesh.engine.impl.InFlightSet}
+     * doesn't protect this path — {@code enqueue()} runs before that gate.
+     * Enqueue is documented as idempotent, so losing that race is not an
+     * error: the other caller's rows are exactly the outcome this call wanted
+     * too. The hot row is reserved to this node ({@code status = QUEUED}).
      */
     @Override
     public void enqueue(TaskRef taskRef) {
@@ -142,7 +184,7 @@ public class MultiNodeTaskLedger implements ClaimStrategy, TaskLedger {
                 TaskId id = new TaskId(taskRef.taskType(), taskRef.taskId());
                 if (taskRepository.findById(id).isEmpty()) {
                     taskRepository.save(TmTaskEntities.newQueuedRow(taskRef));
-                    inFlightRepository.save(TmTaskEntities.newUnclaimedRow(taskRef));
+                    inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId()));
                 }
             });
         } catch (DataIntegrityViolationException e) {

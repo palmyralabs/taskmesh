@@ -1,0 +1,13 @@
+// End-to-end harness: boots the whole taskmesh engine (via the Spring Boot
+// starter auto-config) against an in-memory H2 database and drives it through
+// real enqueue -> claim -> process -> release/incident/rerun flows. Test-only —
+// no published artifact.
+configurations.testRuntimeClasspath {
+    exclude group: 'org.slf4j', module: 'slf4j-simple'
+}
+
+dependencies {
+    testImplementation project(':taskmesh-spring-boot-starter')
+    testImplementation 'org.springframework.boot:spring-boot-starter-test:3.3.4'
+    testRuntimeOnly 'com.h2database:h2:2.2.224'
+}

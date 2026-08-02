@@ -12,10 +12,23 @@ machinery.
 
 ## Status
 
-Planning stage. No source code yet — see [`docs/planning/`](docs/planning/README.md)
-for the design in progress. Code lands after the interface/module design is settled.
+Under active development. Source lives in [`source/`](source/) as a multi-module
+Gradle build (Java 17):
+
+- `taskmesh-api` — interfaces + domain types only (JDK + SLF4J).
+- `taskmesh-engine` — the driving implementation (feeder, claim loop, dispatcher,
+  worker pool); plain Java, no Spring.
+- `taskmesh-impl` — JPA-backed persistence of the `-api` contracts (the `tm_*`
+  tables; see [`docs/schema.md`](docs/schema.md)).
+- `taskmesh-spring-boot-starter` — optional Spring Boot auto-configuration.
+- `taskmesh-testkit` — in-memory fakes for unit-testing a `TaskProcessor`.
+
+Build and test from `source/`: `./gradlew build`.
 
 ## Source of truth
 
-`docs/planning/` is authoritative. This README is a pointer, not a summary —
-update the planning docs first.
+`docs/planning/` holds the authoritative design discussion and
+[`docs/schema.md`](docs/schema.md) documents the persistence tables. Where a
+planning doc disagrees with the code (e.g. the persistence module is
+`taskmesh-impl`, not the earlier-proposed `taskmesh-postgres`), the code and
+`docs/schema.md` win.

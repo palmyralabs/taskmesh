@@ -65,6 +65,17 @@ public class InMemoryTaskStore {
         });
     }
 
+    /** Operator rerun — resets an existing task to QUEUED with cleared counters; no-op if unknown. */
+    public void rerun(TaskRef taskRef) {
+        rows.computeIfPresent(taskRef, (ref, row) -> {
+            row.status = Status.QUEUED;
+            row.nodeId = null;
+            row.attemptCount = 0;
+            row.nextRetryAt = null;
+            return row;
+        });
+    }
+
     public synchronized List<TaskRef> findClaimable(String taskType, Instant now, int limit) {
         List<TaskRef> candidates = new ArrayList<>();
         for (Row row : rows.values()) {

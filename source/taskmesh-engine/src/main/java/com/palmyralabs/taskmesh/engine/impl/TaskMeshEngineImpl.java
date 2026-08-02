@@ -175,6 +175,28 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
                 performedBy, "Cluster resume requested", Instant.now()));
     }
 
+    @Override
+    public void rerun(TaskRef taskRef, String performedBy) {
+        taskLedger.rerun(taskRef);
+        incidentStore.resolve(taskRef, performedBy);
+        auditEventSink.record(new AuditEvent("TASK_RERUN", taskRef, ActorType.APPLICATION_USER,
+                performedBy, "Task manually requeued for rerun", Instant.now()));
+        // Best-effort immediate pickup on this node (same fast-path as execute()); the poller is the safety net.
+        if (inFlightSet.add(taskRef)) {
+            boolean pushed = executionQueue.offerRegular(dispatchTask(taskRef));
+            if (!pushed) {
+                inFlightSet.remove(taskRef);
+            }
+        }
+    }
+
+    @Override
+    public void resolveIncident(TaskRef taskRef, String performedBy) {
+        incidentStore.resolve(taskRef, performedBy);
+        auditEventSink.record(new AuditEvent("INCIDENT_RESOLVED", taskRef, ActorType.APPLICATION_USER,
+                performedBy, "Incident manually resolved", Instant.now()));
+    }
+
     /**
      * Plain enqueue — external API. Persists via {@link TaskLedger#enqueue}
      * unconditionally; additionally pushes into the execution queue's
@@ -228,6 +250,9 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
     /** The poller — engine-owned timer now drives TaskLedger.pullPending (D22), not a self-scheduled SchedulingStrategy. */
     private void pollOnce() {
+        if (pauseController.isPauseRequested()) {
+            return; // paused — the poller stops claiming new work (in-flight tasks still finish).
+        }
         for (String taskType : taskTypes) {
             int available = Math.min(executionQueue.regularRemainingCapacity(), schedulingConfig.getBatchSize());
             if (available <= 0) {
@@ -261,6 +286,11 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     }
 
     private void attempt(TaskRef taskRef) {
+        // Paused: do not claim new work — leave it QUEUED for pickup on resume. This also
+        // covers the enqueue()/execute() fast-path, which reaches here without the poller.
+        if (pauseController.isPauseRequested()) {
+            return;
+        }
         // Phase 2 — Claim
         ClaimOutcome claimOutcome = claimStrategy.claim(taskRef);
         if (claimOutcome == ClaimOutcome.LOST) {

@@ -50,6 +50,17 @@ public interface TaskMeshEngine {
     void resume(String performedBy);
 
     /**
+     * Operator rerun of a specific task — resets it to {@code QUEUED} (even
+     * from a terminal outcome, recreating the hot claim row and clearing retry
+     * counters), resolves any open incident for it, writes an
+     * {@code AuditEvent}, and pushes it for immediate pickup on this node.
+     */
+    void rerun(TaskRef taskRef, String performedBy);
+
+    /** Operator resolution of a task's open incident(s) without rerunning it — audited, no state reset. */
+    void resolveIncident(TaskRef taskRef, String performedBy);
+
+    /**
      * Plain enqueue — external API. Persists unconditionally; additionally
      * pushes into the execution queue if it isn't already past half
      * capacity (D25). If the gate fails, the row is still durable — the

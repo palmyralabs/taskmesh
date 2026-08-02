@@ -53,7 +53,7 @@ import java.util.List;
  * bean — deliberately not auto-discovered (explicit per-engine processor
  * list, not "every TaskProcessor in the context").
  */
-@AutoConfiguration
+@AutoConfiguration(after = TaskmeshJpaAutoConfiguration.class)
 @EnableConfigurationProperties(TaskmeshProperties.class)
 @ConditionalOnBean(TmTaskRepository.class)
 public class TaskmeshEngineAutoConfiguration {

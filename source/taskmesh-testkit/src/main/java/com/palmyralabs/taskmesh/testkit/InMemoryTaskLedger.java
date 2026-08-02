@@ -22,4 +22,9 @@ public class InMemoryTaskLedger implements TaskLedger {
     public void enqueue(TaskRef taskRef) {
         store.enqueue(taskRef);
     }
+
+    @Override
+    public void rerun(TaskRef taskRef) {
+        store.rerun(taskRef);
+    }
 }

@@ -57,11 +57,12 @@ class MultiNodeTaskLedgerTest {
     }
 
     // leaseDuration=5min, reclaimWindow=30s (write-min only, never eligibility),
-    // affinityWindow=60s, claimTimeout=10min.
+    // affinityWindow=60s, claimTimeout=10min, reservationWindow=60s.
     private MultiNodeTaskLedger ledgerFor(String nodeId) {
         return new MultiNodeTaskLedger(taskRepository, inFlightRepository, transactionTemplate, () -> nodeId,
                 new ExponentialBackoffRetryPolicy(3, Duration.ofMillis(1), Duration.ofMillis(1)),
-                Duration.ofMinutes(5), Duration.ofSeconds(30), Duration.ofSeconds(60), Duration.ofMinutes(10));
+                Duration.ofMinutes(5), Duration.ofSeconds(30), Duration.ofSeconds(60), Duration.ofMinutes(10),
+                Duration.ofSeconds(60));
     }
 
     private TmInFlightEntity inFlightRow(TaskRef taskRef) {
@@ -74,19 +75,17 @@ class MultiNodeTaskLedgerTest {
 
     /**
      * Simulates "this hot row is from way in the past, ready to be picked up
-     * now" — also clears the cold row's nextRetryAt (rather than relying on
-     * the retry policy's real, tiny backoff window elapsing in wall-clock
-     * time, which made an earlier version of this suite flaky).
+     * now" — backdates the hot row's updatedAt (which drives the reservation/
+     * affinity/claim-timeout windows) and clears its nextRetryAt (rather than
+     * relying on the retry policy's real, tiny backoff window elapsing in
+     * wall-clock time, which made an earlier version of this suite flaky).
      */
     private void backdateUpdatedAt(TaskRef taskRef, Instant when) {
         transactionTemplate.executeWithoutResult(status -> {
             TmInFlightEntity row = inFlightRow(taskRef);
             row.setUpdatedAt(when);
+            row.setNextRetryAt(null);
             inFlightRepository.save(row);
-
-            TmTaskEntity task = taskRow(taskRef);
-            task.setNextRetryAt(null);
-            taskRepository.save(task);
         });
     }
 
@@ -214,9 +213,12 @@ class MultiNodeTaskLedgerTest {
         node1.release(releasedByNode1Stale, ReleaseRequest.requeue("X", "x"));
         backdateUpdatedAt(releasedByNode1Stale, Instant.now().minus(Duration.ofMinutes(5)));
 
+        // queued was enqueued by node1 (reserved to it) — age it past the reservation window so node2 can see it.
+        backdateUpdatedAt(queued, Instant.now().minus(Duration.ofMinutes(5)));
+
         List<TaskRef> node2Pending = node2.pullPending("T", Instant.now(), 100);
 
-        assertTrue(node2Pending.contains(queued));
+        assertTrue(node2Pending.contains(queued), "QUEUED past its reservation window is open to any node");
         assertTrue(node2Pending.contains(claimedByNode1Stale), "stale claim (past claimTimeout) must be stealable");
         assertTrue(node2Pending.contains(releasedByNode1Stale), "released past affinity must be open to any node");
         assertFalse(node2Pending.contains(claimedByNode1Fresh), "fresh claim by another node must not be offered");
@@ -245,6 +247,54 @@ class MultiNodeTaskLedgerTest {
         assertEquals(TaskStatus.QUEUED, taskRow(taskRef).getStatus());
         Optional<TmInFlightEntity> hot = inFlightRepository.findById(new TaskId("T", "15"));
         assertTrue(hot.isPresent(), "enqueue must create the hot row eagerly, not lazily on first claim");
-        assertEquals(null, hot.get().getStatus(), "unclaimed hot row starts with status=null");
+        assertEquals(TaskStatus.QUEUED, hot.get().getStatus(), "the hot row is reserved (QUEUED) to the enqueuing node");
+        assertEquals("node-1", hot.get().getNodeId(), "reservation keys on the enqueuing node's id");
+    }
+
+    @Test
+    void reservedQueuedIsNotStealableByAnotherNodeWithinReservationWindow() {
+        TaskRef taskRef = new TaskRef("T", "16");
+        node1.enqueue(taskRef); // QUEUED, reserved to node-1
+
+        assertEquals(ClaimOutcome.LOST, node2.claim(taskRef), "a fresh reservation must not be stealable by another node");
+        assertEquals(ClaimOutcome.WON, node1.claim(taskRef), "the reserving node claims its own work immediately");
+    }
+
+    @Test
+    void reservedQueuedBecomesStealableAfterReservationWindow() {
+        TaskRef taskRef = new TaskRef("T", "17");
+        node1.enqueue(taskRef);
+
+        backdateUpdatedAt(taskRef, Instant.now().minus(Duration.ofMinutes(5))); // past the 60s reservation window
+
+        assertEquals(ClaimOutcome.WON, node2.claim(taskRef), "past the reservation window, any node may steal a still-QUEUED row");
+    }
+
+    @Test
+    void rerunRecreatesTheHotRowForATerminallyFailedTaskAndMakesItClaimableAgain() {
+        TaskRef taskRef = new TaskRef("T", "18");
+        node1.enqueue(taskRef);
+        node1.claim(taskRef);
+        node1.release(taskRef, ReleaseRequest.failedTerminal("BOOM", "dead")); // terminal — deletes the hot row
+
+        assertEquals(TaskStatus.FAILED, taskRow(taskRef).getStatus());
+        assertTrue(inFlightRepository.findById(new TaskId("T", "18")).isEmpty(), "terminal deleted the hot row");
+
+        node1.rerun(taskRef);
+
+        TmInFlightEntity hot = inFlightRow(taskRef);
+        assertEquals(TaskStatus.QUEUED, hot.getStatus(), "rerun recreates the hot row, reserved and QUEUED");
+        assertEquals(0, hot.getAttemptCount(), "rerun clears the retry counter");
+        assertEquals(TaskStatus.QUEUED, taskRow(taskRef).getStatus(), "cold row forced back to QUEUED");
+        assertEquals(ClaimOutcome.WON, node1.claim(taskRef), "reran task is claimable again");
+    }
+
+    @Test
+    void rerunIsANoOpForANeverEnqueuedTask() {
+        TaskRef unknown = new TaskRef("T", "19");
+        node1.rerun(unknown);
+
+        assertTrue(inFlightRepository.findById(new TaskId("T", "19")).isEmpty(),
+                "rerun must not fabricate a hot row without a cold ledger row (pair invariant)");
     }
 }

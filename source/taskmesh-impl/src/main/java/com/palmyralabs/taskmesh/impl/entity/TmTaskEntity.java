@@ -30,6 +30,14 @@ import java.time.Instant;
  * {@code FAILED} here — {@code CLAIMED}/{@code RELEASED} live exclusively
  * on {@link TmInFlightEntity}.
  *
+ * <p>Query/claim/release never read this table — it is written only at
+ * enqueue ({@code QUEUED}) and on the terminal transition, where the final
+ * {@code attempt_count}/{@code max_attempts} are <b>copied from the hot
+ * {@link TmInFlightEntity} row</b> (the live counters live there now) as a
+ * durable snapshot before that row is deleted. There is no {@code next_retry_at}
+ * here anymore — the backoff gate moved to the hot row with the rest of the
+ * claim-driving state.
+ *
  * <p>Carries no payload column (D23/D24) — payload resolution is entirely
  * the consuming project's own {@code PayloadProviderFactory}/{@code PayloadProvider}
  * concern, never taskmesh's to store.
@@ -54,14 +62,13 @@ public class TmTaskEntity {
     @Column(name = "status", nullable = false, length = 32)
     private TaskStatus status;
 
+    /** Final attempt count — snapshotted from the hot row on the terminal transition (0 until then). */
     @Column(name = "attempt_count", nullable = false)
     private int attemptCount;
 
+    /** Snapshotted from the hot row on the terminal transition. */
     @Column(name = "max_attempts", nullable = false)
     private int maxAttempts;
-
-    @Column(name = "next_retry_at")
-    private Instant nextRetryAt;
 
     @Column(name = "reason_code")
     private String reasonCode;

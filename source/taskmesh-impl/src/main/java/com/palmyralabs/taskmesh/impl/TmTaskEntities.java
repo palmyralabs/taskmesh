@@ -18,26 +18,39 @@ final class TmTaskEntities {
     private TmTaskEntities() {
     }
 
+    // Row-level cap left effectively unbounded — the wired RetryPolicy is the
+    // real gate (Math.min against it in requeueRelease), matching D16.
+    static final int UNBOUNDED_MAX_ATTEMPTS = Integer.MAX_VALUE;
+
+    /** Cold ledger row — {@code QUEUED} at enqueue; {@code attempt_count}/{@code max_attempts} are placeholders until the terminal snapshot copies them from the hot row. */
     static TmTaskEntity newQueuedRow(TaskRef taskRef) {
         TmTaskEntity entity = new TmTaskEntity();
         entity.setTaskType(taskRef.taskType());
         entity.setTaskId(taskRef.taskId());
         entity.setStatus(TaskStatus.QUEUED);
         entity.setAttemptCount(0);
-        // Row-level cap left effectively unbounded — the wired RetryPolicy is
-        // the real gate (Math.min against it in requeueRelease), matching D16.
-        entity.setMaxAttempts(Integer.MAX_VALUE);
+        entity.setMaxAttempts(UNBOUNDED_MAX_ATTEMPTS);
         Instant now = Instant.now();
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
         return entity;
     }
 
-    /** {@code status = null} — unclaimed/staged, not yet claimed by anyone. */
-    static TmInFlightEntity newUnclaimedRow(TaskRef taskRef) {
+    /**
+     * Hot claim-state row for the {@code enqueue}/{@code execute} path —
+     * {@code status = QUEUED}, reserved to the enqueuing {@code nodeId} (its
+     * reservation window), carrying the live retry counters. A bulk/external
+     * populate path bypasses this and inserts an unreserved ({@code status = null},
+     * {@code node_id = null}) row directly.
+     */
+    static TmInFlightEntity newReservedRow(TaskRef taskRef, String nodeId) {
         TmInFlightEntity entity = new TmInFlightEntity();
         entity.setTaskType(taskRef.taskType());
         entity.setTaskId(taskRef.taskId());
+        entity.setStatus(TaskStatus.QUEUED);
+        entity.setNodeId(nodeId);
+        entity.setAttemptCount(0);
+        entity.setMaxAttempts(UNBOUNDED_MAX_ATTEMPTS);
         Instant now = Instant.now();
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);

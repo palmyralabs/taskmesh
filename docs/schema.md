@@ -25,6 +25,16 @@ auto-create/update) — see `dbscripts/edms_mig/007_tm_task.sql` through
 > terminal outcome deletes the `tm_in_flight` row. See their sections below
 > for the split rationale — read them together, not in isolation.
 
+> **The hot `tm_in_flight` row is the sole source of truth for query/claim/release.**
+> All the state those operations need — `status` (including the `QUEUED`
+> reservation), `node_id`, the retry counters (`attempt_count`/`max_attempts`)
+> and the backoff gate (`next_retry_at`) — lives on the hot row. `tm_task` is
+> written only at enqueue and, as a cold snapshot, on the terminal transition;
+> query/claim/release never read it. This is a deliberate tightening of D28:
+> the discovery/claim queries no longer join out to `tm_task` at all (a hot
+> row exists iff the task is non-terminal), and a retryable release touches
+> only the hot row.
+
 > **Postgres note**: the `TEXT`-like columns (`error_summary`, `detail`,
 > `message`) are mapped with `@JdbcTypeCode(SqlTypes.LONGVARCHAR)`, not
 > `@Lob`. On Postgres, `@Lob` on a `String` defaults to the `oid` large-object
@@ -38,10 +48,11 @@ auto-create/update) — see `dbscripts/edms_mig/007_tm_task.sql` through
 ## `tm_task` (cold)
 
 The ledger table — one row per task (`task_type` + `task_id`) for its
-**entire lifetime**, touched only at enqueue and on terminal/requeue
-transitions. Deliberately carries **no payload column**: payload resolution
-is entirely the consuming application's `PayloadProviderFactory`/
-`PayloadProvider` concern, never taskmesh's to store.
+**entire lifetime**, touched only at enqueue and on the **terminal**
+transition (a retryable requeue no longer touches it — that's now hot-row-only).
+Deliberately carries **no payload column**: payload resolution is entirely the
+consuming application's `PayloadProviderFactory`/`PayloadProvider` concern,
+never taskmesh's to store.
 
 `status` here only ever holds `QUEUED`, `COMPLETED`, or `FAILED` — `CLAIMED`/
 `RELEASED` live exclusively on `tm_in_flight` below (D28). This split exists
@@ -57,82 +68,93 @@ Postgres-specific tuning).
 | Column             | Notes                                                                                  |
 |---------------------|-----------------------------------------------------------------------------------------|
 | `task_type`, `task_id` (PK) | Task identity. `task_type` is a runtime string key (e.g. `"POLICY_MIGRATE"`); `task_id` is opaque to taskmesh — the consuming app decides its format (e.g. `branchCode:policyNumber`). |
-| `status`            | `QUEUED`, `COMPLETED`, or `FAILED` only.                                                |
-| `attempt_count` / `max_attempts` | Retry bookkeeping. Exhaustion (`attempt_count >= max_attempts`) is checked pessimistically via `findForUpdate` before a retryable failure is turned into a terminal one. |
-| `next_retry_at`     | Backoff gate for `QUEUED` rows — discovery/claim queries skip a row until this passes. `NULL` means immediately eligible. |
-| `reason_code`, `error_summary` | Set on terminal transitions (`COMPLETED` clears them; `FAILED` records why). |
+| `status`            | `QUEUED` (at enqueue), then `COMPLETED` or `FAILED` at the terminal transition. Never read by claim/discovery. |
+| `attempt_count` / `max_attempts` | **Terminal snapshot** — copied from the hot row on the terminal transition (the live counters live on `tm_in_flight` now). `0`/placeholder until then. |
+| `reason_code`, `error_summary` | Set on the terminal transition (`COMPLETED` clears them; `FAILED` records why). |
 | `created_at`, `updated_at` | Standard audit timestamps. |
+
+There is no `next_retry_at` here — the backoff gate moved to `tm_in_flight`
+with the rest of the claim-driving state.
 
 ## `tm_in_flight` (hot)
 
-The claim-state table — all claim/renew/release churn lands here, never on
-`tm_task`. One row per task that's been enqueued and isn't yet terminal:
-created **eagerly, alongside the `tm_task` row, at enqueue time**
-(`status = NULL`, unclaimed — not lazily staged on first claim attempt like
-the toolkit's original `in_flight` table), transitions to `CLAIMED`/
-`RELEASED` as a `ClaimStrategy` drives it, and is **deleted entirely** the
-moment the task reaches a terminal outcome (`COMPLETED`, `FAILED`, including
-retry exhaustion) — so this table's steady-state size tracks current
-backlog+active count, never all-time history.
+The claim-state table and the **sole source of truth for query/claim/release**
+— all claim/renew/release churn lands here, never on `tm_task`. One row per
+task that's been enqueued and isn't yet terminal: created **eagerly, alongside
+the `tm_task` row, at enqueue time**, transitions through claim states as a
+`ClaimStrategy` drives it, and is **deleted entirely** the moment the task
+reaches a terminal outcome (`COMPLETED`, `FAILED`, including retry exhaustion)
+— so this table's steady-state size tracks current backlog+active count, never
+all-time history.
+
+On the `enqueue`/`execute` path the row is created `status = QUEUED`,
+**reserved to the enqueuing node** (`node_id` set); a bulk/external populate
+path may instead insert an unreserved `status = NULL` row directly.
 
 | Column             | Notes                                                                                  |
 |---------------------|-----------------------------------------------------------------------------------------|
 | `task_type`, `task_id` (PK) | Same identity as the paired `tm_task` row. |
-| `status`            | `NULL` (unclaimed/staged), `CLAIMED`, or `RELEASED`.                                    |
-| `node_id`           | Current or last owner. **Not cleared** on a `MultiNodeTaskLedger` retryable release — kept as "last owner" metadata (paired with `status='RELEASED'`) so the affinity window has something to key on. `SimpleTaskLedger` clears it immediately on release (no affinity concept). |
-| `claimed_at`        | When the current claim started. Only bumped forward on a genuine re-claim (new owner, or the same owner reclaiming after the short write-minimization window) — see the 3-window model below. |
+| `status`            | `QUEUED` (freshly enqueued, reserved to `node_id`), `NULL` (unreserved, bulk/external), `CLAIMED`, or `RELEASED`. |
+| `node_id`           | For `QUEUED`, the enqueuing (reserving) node. For `CLAIMED`/`RELEASED`, the current/last owner. **Not cleared** on a `MultiNodeTaskLedger` retryable release — kept as "last owner" so the affinity window has something to key on. `SimpleTaskLedger` clears it on release (no affinity concept). |
+| `attempt_count` / `max_attempts` | Live retry bookkeeping (moved off `tm_task`). Exhaustion (`attempt_count + 1 > min(max_attempts, RetryPolicy.maxAttempts)`) is decided here inside the release, then the final values are copied onto the `tm_task` snapshot. |
+| `next_retry_at`     | Backoff gate — **discovery** skips the row until this passes (`NULL` = immediately eligible). Set on a retryable release. Claim itself does not gate on it (discovery already filtered). |
+| `claimed_at`        | When the current claim started. Only bumped forward on a genuine re-claim (new owner, or the same owner reclaiming after the short write-minimization window) — see the window model below. |
 | `lease_expires_at`  | Multi-node only. `HeartbeatStrategy` renews this periodically while a worker holds the task; if it lapses, another node's claim query treats the row as abandoned (the "claim timeout" window). |
-| `created_at`, `updated_at` | `updated_at` drives the affinity/claim-timeout windows below. |
+| `created_at`, `updated_at` | `updated_at` drives the reservation/affinity/claim-timeout windows below. |
 
 Recommend Postgres-specific tuning here in a consuming app's own DDL
 (fillfactor, `autovacuum_vacuum_scale_factor`) if claim/renew volume is high
 — that part of the toolkit's original design genuinely is deployment-specific
 and stays out of taskmesh's own portable schema.
 
-**Multi-node 3-window claim model** (`MultiNodeTaskLedger`) — discovery is
-driven **FROM `tm_in_flight`**, joined out to `tm_task` for status/
-`next_retry_at` (not the other way round, so the scan starts from the table
-sized by current backlog, not all-time history). A claim query is eligible
-under any of these conditions —
-1. `tm_task.status = QUEUED` and due (`next_retry_at` null or past) — always
-   required, regardless of which case below applies to the hot row.
-2. Hot row `status IS NULL` (never claimed).
-3. `CLAIMED` by the *same* node (idempotent re-claim / lease renewal path).
-4. `RELEASED`, owned by the same node, and within the **affinity window**
-   (`updated_at >= now - affinitySeconds`) — gives the last owner first
-   refusal on a task it just released, so a single flaky task doesn't bounce
-   between nodes.
-5. `RELEASED` and *past* the affinity window — open to any node.
-6. `CLAIMED` but past the **claim-timeout window**
+**Multi-node 4-window claim model** (`MultiNodeTaskLedger`) — discovery and
+claim are driven **entirely FROM `tm_in_flight`**, with no join to `tm_task`
+(a hot row exists iff the task is non-terminal, so the cold status check is
+redundant). A row is eligible under any of these conditions —
+1. `status IS NULL` (unreserved bulk/external row) — any node.
+2. `status = QUEUED` and `node_id = me` — the reserving node claims its own
+   freshly-enqueued work immediately.
+3. `status = QUEUED` and (`node_id IS NULL` or past the **reservation window**,
+   `updated_at < now - reservationSeconds`) — a reservation the enqueuing node
+   didn't pick up in time is open to any node (so a crashed/overloaded
+   producer never strands its own backlog).
+4. `CLAIMED` by the *same* node (idempotent re-claim / lease renewal path).
+5. `RELEASED`, owned by the same node, within the **affinity window**
+   (`updated_at >= now - affinitySeconds`) — last owner gets first refusal, so
+   a flaky task doesn't bounce between nodes.
+6. `RELEASED` and *past* the affinity window — open to any node.
+7. `CLAIMED` but past the **claim-timeout window**
    (`updated_at < now - claimTimeoutSeconds`) — the owning node is presumed
    dead; any node may steal it.
 
-The **reclaim window** (`reclaimSeconds`, much shorter than the affinity
-window) only affects whether `claimed_at` is bumped forward on the `SET`
-side of the claim UPDATE — it never appears in the eligibility `WHERE`
-clause. Mixing the two up (letting the short reclaim window leak into
-eligibility) was a real bug pulled from prior-art history; `findClaimableMultiNode`
-and `claimMultiNode` must stay in exact sync on eligibility, or discovery and
-claim drift apart — now doubly true since both queries also have to stay in
-sync on *which table drives the join*.
+**Discovery additionally enforces the backoff gate** (`next_retry_at` null or
+past); claim does not (its caller already filtered through discovery). The
+**reclaim window** (`reclaimSeconds`, much shorter than affinity) only affects
+whether `claimed_at` is bumped forward on the `SET` side of the claim UPDATE —
+it never appears in eligibility. Mixing the windows up (letting the short
+reclaim window leak into eligibility) was a real bug from prior-art history;
+`findClaimableMultiNode` and `claimMultiNode` **must stay in exact sync** on
+the eligibility block above, or discovery and claim drift apart.
 
 **Release**, split by outcome:
-- **Terminal** (`COMPLETED`/`FAILED`) — the hot row is deleted first, fenced
-  on `node_id` + `status='CLAIMED'` (0 rows deleted means ownership was
-  already lost, and `tm_task` is never touched); only then is `tm_task`
-  updated, unconditionally by PK — ownership fencing lives entirely on the
-  hot-table op now.
-- **Requeue** (retryable) — `MultiNodeTaskLedger` sets the hot row to
-  `RELEASED` (node_id retained); on exhaustion the hot row is deleted right
-  after (terminal — the just-set `RELEASED` no longer means anything).
-  `SimpleTaskLedger` resets the hot row straight to unclaimed instead.
+- **Terminal** (`COMPLETED`/`FAILED`) — the hot row's final `attempt_count`/
+  `max_attempts` are read, then the hot row is deleted, fenced on `node_id` +
+  `status='CLAIMED'` (0 rows deleted means ownership was already lost, and
+  `tm_task` is never touched); only then is `tm_task` updated by PK, copying
+  those counters plus the terminal status/reason as the cold snapshot.
+- **Requeue** (retryable) — touches only the hot row: `MultiNodeTaskLedger`
+  fences it to `RELEASED` (node_id retained), increments `attempt_count` and
+  sets `next_retry_at`. On exhaustion it instead snapshots the final counters
+  to `tm_task` (status `FAILED`) and deletes the hot row.
+  `SimpleTaskLedger` resets the hot row straight to unclaimed (node cleared)
+  rather than `RELEASED`, but otherwise increments/gates the same way.
 
-`SimpleTaskLedger` (single-node) skips the lease/affinity/claim-timeout
-machinery entirely — `claimSingleNode` is a plain `status IS NULL -> CLAIMED`
-UPDATE (still joined to `tm_task.status = QUEUED` via `EXISTS`), and
-`recoverOwnClaims` resets this node's own stale `CLAIMED` hot rows back to
-unclaimed at startup (safe because a single-node deployment is definitionally
-the only writer).
+`SimpleTaskLedger` (single-node) skips the lease/affinity/claim-timeout/
+reservation machinery entirely — `claimSingleNode` is a plain
+`status IN (NULL, QUEUED) -> CLAIMED` UPDATE against the hot row alone (no
+`tm_task` join), and `recoverOwnClaims` resets this node's own stale `CLAIMED`
+hot rows back to unclaimed at startup (safe because a single-node deployment is
+definitionally the only writer).
 
 ## `tm_history_event`
 
