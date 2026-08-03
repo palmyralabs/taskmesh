@@ -25,6 +25,7 @@ import java.util.function.BooleanSupplier;
 class DefaultTaskContext implements TaskContext {
 
     private final TaskRef taskRef;
+    private final int attemptNumber;
     private final PayloadProvider payloadProvider;
     private final HeartbeatStrategy heartbeatStrategy;
     private final PauseController pauseController;
@@ -37,9 +38,10 @@ class DefaultTaskContext implements TaskContext {
 
     private volatile boolean ownershipValid = true;
 
-    DefaultTaskContext(TaskRef taskRef, PayloadProvider payloadProvider, HeartbeatStrategy heartbeatStrategy,
+    DefaultTaskContext(TaskRef taskRef, int attemptNumber, PayloadProvider payloadProvider, HeartbeatStrategy heartbeatStrategy,
                         PauseController pauseController, BooleanSupplier shutdownRequested) {
         this.taskRef = taskRef;
+        this.attemptNumber = attemptNumber;
         this.payloadProvider = payloadProvider;
         this.heartbeatStrategy = heartbeatStrategy;
         this.pauseController = pauseController;
@@ -51,6 +53,11 @@ class DefaultTaskContext implements TaskContext {
     @Override
     public TaskRef taskRef() {
         return taskRef;
+    }
+
+    @Override
+    public int attemptNumber() {
+        return attemptNumber;
     }
 
     @Override

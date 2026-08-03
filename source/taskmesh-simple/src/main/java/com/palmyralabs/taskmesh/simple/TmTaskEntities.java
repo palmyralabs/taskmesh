@@ -37,19 +37,25 @@ final class TmTaskEntities {
     }
 
     /**
-     * Hot claim-state row for the {@code enqueue}/{@code execute} path —
+     * Hot claim-state row for the {@code enqueue}/{@code execute}/rerun paths —
      * {@code status = QUEUED}, reserved to the enqueuing {@code nodeId} (its
      * reservation window), carrying the live retry counters. A bulk/external
      * populate path bypasses this and inserts an unreserved ({@code status = null},
      * {@code node_id = null}) row directly.
+     *
+     * <p>{@code attemptCount} is caller-supplied rather than hardcoded — the
+     * hot row's counter always represents "the current attempt's own
+     * number," seeded as the cold row's {@code attempt_count + 1} (1 for a
+     * brand-new task at enqueue, since its cold row is always freshly 0; the
+     * carried-forward value at rerun).
      */
-    static TmInFlightEntity newReservedRow(TaskRef taskRef, String nodeId) {
+    static TmInFlightEntity newReservedRow(TaskRef taskRef, String nodeId, int attemptCount) {
         TmInFlightEntity entity = new TmInFlightEntity();
         entity.setTaskType(taskRef.taskType());
         entity.setTaskId(taskRef.taskId());
         entity.setStatus(TaskStatus.QUEUED);
         entity.setNodeId(nodeId);
-        entity.setAttemptCount(0);
+        entity.setAttemptCount(attemptCount);
         entity.setMaxAttempts(UNBOUNDED_MAX_ATTEMPTS);
         Instant now = Instant.now();
         entity.setCreatedAt(now);

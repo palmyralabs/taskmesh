@@ -24,6 +24,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -277,16 +278,58 @@ class MultiNodeTaskLedgerTest {
         node1.claim(taskRef);
         node1.release(taskRef, ReleaseRequest.failedTerminal("BOOM", "dead")); // terminal — deletes the hot row
 
+        // attempt_count on the cold snapshot = the attempt that just failed terminally: attempt 1.
         assertEquals(TaskStatus.FAILED, taskRow(taskRef).getStatus());
+        assertEquals(1, taskRow(taskRef).getAttemptCount(), "cold snapshot holds the attempt that just ran");
         assertTrue(inFlightRepository.findById(new TaskId("T", "18")).isEmpty(), "terminal deleted the hot row");
 
         node1.rerun(taskRef);
 
         TmInFlightEntity hot = inFlightRow(taskRef);
         assertEquals(TaskStatus.QUEUED, hot.getStatus(), "rerun recreates the hot row, reserved and QUEUED");
-        assertEquals(0, hot.getAttemptCount(), "rerun clears the retry counter");
+        assertEquals(2, hot.getAttemptCount(), "seeded from cold's attempt_count (1) + 1 — the next attempt is #2");
         assertEquals(TaskStatus.QUEUED, taskRow(taskRef).getStatus(), "cold row forced back to QUEUED");
         assertEquals(ClaimOutcome.WON, node1.claim(taskRef), "reran task is claimable again");
+    }
+
+    @Test
+    void rerunThrowsWhenAHotRowAlreadyExists() {
+        TaskRef taskRef = new TaskRef("T", "23");
+        node1.enqueue(taskRef);
+        node1.claim(taskRef); // hot row now CLAIMED, still exists
+
+        assertThrows(IllegalStateException.class, () -> node1.rerun(taskRef),
+                "rerun must refuse a task that's still alive in the ordinary claim/retry cycle");
+        assertEquals(TaskStatus.CLAIMED, inFlightRow(taskRef).getStatus(), "the live hot row must be untouched");
+    }
+
+    @Test
+    void rerunCarriesTheExhaustedAttemptCountForwardRatherThanResettingIt() {
+        TaskRef taskRef = new TaskRef("T", "22");
+        node1.enqueue(taskRef);
+
+        // Exhaust the retry budget (maxAttempts=3): 3 successful requeues (attempts 1,2,3 all retried),
+        // then a 4th claim+release is the attempt that trips exhaustion — matching the historical
+        // "maxAttempts=N allows N+1 total attempts" budget behavior, independent of attempt_count numbering.
+        for (int i = 0; i < 3; i++) {
+            node1.claim(taskRef);
+            assertEquals(ReleaseOutcome.OK, node1.release(taskRef, ReleaseRequest.requeue("BOOM", "fail " + i)));
+            backdateUpdatedAt(taskRef, Instant.now().minus(Duration.ofMinutes(5)));
+        }
+        node1.claim(taskRef);
+        assertEquals(ReleaseOutcome.EXHAUSTED, node1.release(taskRef, ReleaseRequest.requeue("BOOM", "final fail")));
+        int exhaustedAttemptCount = taskRow(taskRef).getAttemptCount();
+        assertEquals(4, exhaustedAttemptCount, "cold snapshot holds attempt 4 — the one that just exhausted the budget");
+        assertTrue(inFlightRepository.findById(new TaskId("T", "22")).isEmpty(), "exhaustion deleted the hot row");
+
+        node1.rerun(taskRef);
+
+        // tm_attempt_history is keyed by (taskType, taskId, attemptNumber) — reusing 4 here would
+        // collide with, and silently overwrite, the pre-rerun attempt-4 row.
+        assertEquals(exhaustedAttemptCount + 1, inFlightRow(taskRef).getAttemptCount(),
+                "rerun seeds from cold's attempt_count + 1, continuing past the pre-rerun attempts");
+        assertEquals(exhaustedAttemptCount + 1, node1.attemptCount(taskRef),
+                "attemptCount() must reflect the carried-forward count so the next HistoryEvent gets a fresh attemptNumber");
     }
 
     @Test

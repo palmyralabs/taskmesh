@@ -47,24 +47,6 @@ consumer genuinely needs internal sub-step sequencing — until then, a
 `TaskProcessor` that needs multiple steps just does them sequentially inside
 its own `process()` call.
 
-## Q-ATTEMPTNUM — `HistoryEvent.attemptNumber` has no authoritative source at `-engine`
-
-`HistoryEvent(TaskRef, int attemptNumber, HistoryEventType, String detail,
-Instant occurredAt)` requires an attempt number, but D16 keeps the real
-`attempt_count` counter entirely inside `ClaimStrategy`'s own storage,
-updated atomically inside `release()` — no interface exposes it back to the
-engine (`ClaimOutcome`/`RenewOutcome`/`ReleaseOutcome` are all bare enums,
-now `EXHAUSTED`-aware per D19 but still not attempt-count-aware). Current
-`-engine` implementation tracks a **best-effort, engine-local, non-authoritative**
-counter (in-memory, per `TaskRef`, incremented each time *this node's*
-dispatch loop attempts that ref) purely so `HistoryEvent` has something to
-carry — it will disagree with the real count after a cross-node retry or a
-node restart. Open: should `ClaimStrategy.claim()`/`release()` return the
-authoritative attempt number so `HistoryWriter` entries are trustworthy, or
-is best-effort acceptable given `HistoryWriter` is audit-only (never read by
-control flow, per its own Javadoc) and a slightly-off attempt number in an
-audit log is low-stakes?
-
 ## Q-OBSERVABILITY — Metrics/observability design
 
 Both peer projects have essentially no working metrics layer (Actuator

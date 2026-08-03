@@ -3,6 +3,7 @@ import com.palmyralabs.taskmesh.max.entity.PartitionedTaskId;
 import com.palmyralabs.taskmesh.max.entity.TaskId;
 import com.palmyralabs.taskmesh.max.entity.TaskStatus;
 import com.palmyralabs.taskmesh.max.entity.TmInFlightEntity;
+import com.palmyralabs.taskmesh.max.entity.TmTaskEntity;
 import com.palmyralabs.taskmesh.max.repository.TmInFlightRepository;
 import com.palmyralabs.taskmesh.max.repository.TmTaskRepository;
 
@@ -138,19 +139,22 @@ public class PartitionedTaskLedger implements ClaimStrategy, TaskLedger {
 
         TmInFlightEntity hot = inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId()))
                 .orElseThrow(() -> new IllegalStateException("tm_in_flight row missing for " + taskRef + " despite a fenced hot-row release"));
-        int nextAttempt = hot.getAttemptCount() + 1;
         int effectiveMaxAttempts = Math.min(hot.getMaxAttempts(), retryPolicy.maxAttempts());
 
-        if (nextAttempt > effectiveMaxAttempts) {
+        // Exhaustion is checked against the attempt that just ran (hot.getAttemptCount() — its own number,
+        // set at claim time), not a "next candidate" — this preserves the historical retry-budget behavior
+        // (maxAttempts=N allows N+1 total attempts) independent of how attempt_count is now numbered.
+        if (hot.getAttemptCount() > effectiveMaxAttempts) {
             // Exhausted — snapshot the final counters onto the cold row, then drop the just-RELEASED hot row.
             taskRepository.terminalUpdate(taskRef.taskType(), taskRef.taskId(), taskRef.partitionKey(), TaskStatus.FAILED,
-                    nextAttempt, hot.getMaxAttempts(), request.reasonCode(), request.errorSummary(), now);
+                    hot.getAttemptCount(), hot.getMaxAttempts(), request.reasonCode(), request.errorSummary(), now);
             inFlightRepository.deleteByTaskTypeAndTaskId(taskRef.taskType(), taskRef.taskId());
             return ReleaseOutcome.EXHAUSTED;
         }
 
-        // Within budget — bump the counter and set the backoff gate on the hot row.
+        // Within budget — bump the counter to the next attempt's own number and set the backoff gate.
         // node_id retained (RELEASED, from markReleased) so the affinity window has a key.
+        int nextAttempt = hot.getAttemptCount() + 1;
         hot.setAttemptCount(nextAttempt);
         hot.setNextRetryAt(retryPolicy.nextRetryAt(nextAttempt));
         hot.setUpdatedAt(now);
@@ -164,12 +168,19 @@ public class PartitionedTaskLedger implements ClaimStrategy, TaskLedger {
                 now.minus(reservationWindow), now.minus(affinityWindow), now.minus(claimTimeout), PageRequest.of(0, limit));
     }
 
+    @Override
+    public int attemptCount(TaskRef taskRef) {
+        return inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId()))
+                .map(TmInFlightEntity::getAttemptCount)
+                .orElse(0);
+    }
+
     /**
      * Recreates the hot claim row (a terminal outcome may have deleted it),
      * reserved to this node, and forces the cold row back to {@code QUEUED} —
      * all in one transaction. No-op if the task was never enqueued (keeps the
-     * cold/hot pair invariant intact). Forcibly resets even an in-progress
-     * task; the displaced worker's release then reports {@code LOST_OWNERSHIP}.
+     * cold/hot pair invariant intact). Refuses (throws) if a hot row already
+     * exists in any status — see {@link #rerun} in {@code TaskLedger} for why.
      *
      * <p>{@code partitionKey} must be supplied by the caller — it's required
      * to even form the lookup key ({@link PartitionedTaskId}), since it's part
@@ -183,11 +194,24 @@ public class PartitionedTaskLedger implements ClaimStrategy, TaskLedger {
         }
         transactionTemplate.executeWithoutResult(status -> {
             PartitionedTaskId id = new PartitionedTaskId(taskRef.taskType(), taskRef.taskId(), taskRef.partitionKey());
-            if (taskRepository.findById(id).isEmpty()) {
+            TmTaskEntity existing = taskRepository.findById(id).orElse(null);
+            if (existing == null) {
                 return;
             }
+            TaskId hotId = new TaskId(taskRef.taskType(), taskRef.taskId());
+            inFlightRepository.findById(hotId).ifPresent(hotRow -> {
+                throw new IllegalStateException(
+                        "Cannot rerun " + taskRef + " — a hot row already exists (status " + hotRow.getStatus()
+                                + ", node '" + hotRow.getNodeId() + "'). rerun() only resurrects a task whose hot row "
+                                + "was deleted by a terminal outcome; a still-live task doesn't need it — if it's "
+                                + "genuinely stuck, the ordinary claim/lease recovery path will pick it back up.");
+            });
             inFlightRepository.deleteByTaskTypeAndTaskId(taskRef.taskType(), taskRef.taskId());
-            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId()));
+            // Seeded from the cold row's attempt_count + 1 rather than resetting to 0 —
+            // tm_attempt_history is keyed by (taskType, taskId, attemptNumber), so restarting
+            // the counter would make the next attempt's history write collide with and
+            // silently overwrite a pre-rerun row of the same number.
+            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId(), existing.getAttemptCount() + 1));
             taskRepository.forceRequeue(taskRef.taskType(), taskRef.taskId(), taskRef.partitionKey(), Instant.now());
         });
     }

@@ -33,8 +33,6 @@ import lombok.extern.slf4j.Slf4j;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -92,10 +90,6 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         thread.setDaemon(true);
         return thread;
     });
-
-    // Best-effort, engine-local, non-authoritative attempt counter — see
-    // Q-ATTEMPTNUM in docs/planning/open-questions.md.
-    private final ConcurrentMap<TaskRef, AtomicInteger> localAttemptCounters = new ConcurrentHashMap<>();
 
     // Guards workerPool's core/max resize pair (D30) so a shrink and a grow
     // racing each other can't leave core > max mid-flight.
@@ -357,9 +351,10 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
             return; // silent, normal — not logged above debug, per runtime-flow.md
         }
         metricsReporter.taskClaimed(taskRef.taskType());
-        int attemptNumber = localAttemptCounters
-                .computeIfAbsent(taskRef, ref -> new AtomicInteger(0))
-                .incrementAndGet();
+        // Read fresh off the hot row right after claim, rather than an engine-local counter —
+        // that wouldn't survive a JVM restart or agree across nodes. Already the current attempt's
+        // own number (set at row creation, bumped on each requeue) — no further +1. See TaskLedger#attemptCount.
+        int attemptNumber = taskLedger.attemptCount(taskRef);
 
         // Phase 3 — Pre-dispatch
         if (!processorRegistry.isRegistered(taskRef.taskType())) {
@@ -375,7 +370,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
         Duration timeout = timeoutPolicy.timeoutFor(taskRef.taskType());
         Instant deadline = Instant.now().plus(timeout);
-        DefaultTaskContext ctx = new DefaultTaskContext(taskRef, payloadProvider, heartbeatStrategy, pauseController,
+        DefaultTaskContext ctx = new DefaultTaskContext(taskRef, attemptNumber, payloadProvider, heartbeatStrategy, pauseController,
                 () -> shutdownRequested);
         historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.STARTED, null, Instant.now(), nodeInfoProvider.nodeId()));
 

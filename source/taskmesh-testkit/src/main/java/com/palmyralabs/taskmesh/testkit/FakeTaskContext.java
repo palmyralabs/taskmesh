@@ -14,6 +14,7 @@ import com.palmyralabs.taskmesh.api.TaskRef;
 public class FakeTaskContext implements TaskContext {
 
     private final TaskRef taskRef;
+    private final int attemptNumber;
     private final Object payload;
     private final InMemoryProgressReporter progress = new InMemoryProgressReporter();
     private final InMemoryErrorLogger errorLogger = new InMemoryErrorLogger();
@@ -26,6 +27,7 @@ public class FakeTaskContext implements TaskContext {
 
     private FakeTaskContext(Builder builder) {
         this.taskRef = builder.taskRef;
+        this.attemptNumber = builder.attemptNumber;
         this.payload = builder.payload;
         this.onCheckpoint = builder.onCheckpoint;
     }
@@ -37,6 +39,11 @@ public class FakeTaskContext implements TaskContext {
     @Override
     public TaskRef taskRef() {
         return taskRef;
+    }
+
+    @Override
+    public int attemptNumber() {
+        return attemptNumber;
     }
 
     @Override
@@ -106,11 +113,18 @@ public class FakeTaskContext implements TaskContext {
     public static class Builder {
         private final TaskRef taskRef;
         private final Object payload;
+        private int attemptNumber = 1;
         private Runnable onCheckpoint;
 
         private Builder(TaskRef taskRef, Object payload) {
             this.taskRef = taskRef;
             this.payload = payload;
+        }
+
+        /** Defaults to 1 (a task's first attempt) if not set. */
+        public Builder attemptNumber(int attemptNumber) {
+            this.attemptNumber = attemptNumber;
+            return this;
         }
 
         /**

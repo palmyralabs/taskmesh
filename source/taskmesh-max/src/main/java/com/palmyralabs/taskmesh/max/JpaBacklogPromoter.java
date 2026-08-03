@@ -44,8 +44,11 @@ public class JpaBacklogPromoter implements BacklogPromoter {
                 return 0;
             }
             for (TmTaskEntity task : backlog) {
+                // Seeded from the cold row's attempt_count + 1 (see TaskLedger#rerun) — always 1 in
+                // practice here too, since a backlogged task by definition has no hot row yet.
                 TmInFlightEntity hot = TmTaskEntities.newReservedRow(
-                        new TaskRef(task.getTaskType(), task.getTaskId(), task.getPartitionKey()), nodeId);
+                        new TaskRef(task.getTaskType(), task.getTaskId(), task.getPartitionKey()), nodeId,
+                        task.getAttemptCount() + 1);
                 inFlightRepository.save(hot);
             }
             List<String> taskIds = backlog.stream().map(TmTaskEntity::getTaskId).toList();

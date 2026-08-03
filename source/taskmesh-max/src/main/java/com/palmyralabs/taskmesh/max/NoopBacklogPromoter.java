@@ -35,6 +35,12 @@ public class NoopBacklogPromoter implements BacklogPromoter {
      * manually-assigned composite key is an upsert, not insert-or-throw — an
      * unguarded save on a re-enqueue of an already-claimed task would silently
      * reset it back to unclaimed, losing the current owner's claim.
+     *
+     * <p>{@code attempt_count} is seeded from the cold row's
+     * {@code attempt_count + 1} (see {@code TaskLedger#rerun}) — always 1
+     * here in practice, since promotion only ever runs for a task that has
+     * no hot row yet (i.e. has never been attempted), but read fresh rather
+     * than hardcoded so this stays correct if that ever stops holding.
      */
     @Override
     public void onEnqueue(TaskRef taskRef, String nodeId) {
@@ -44,8 +50,9 @@ public class NoopBacklogPromoter implements BacklogPromoter {
                 return;
             }
             Instant now = Instant.now();
-            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeId));
             PartitionedTaskId taskId = new PartitionedTaskId(taskRef.taskType(), taskRef.taskId(), taskRef.partitionKey());
+            int attemptCount = taskRepository.findById(taskId).map(TmTaskEntity::getAttemptCount).orElse(0) + 1;
+            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeId, attemptCount));
             taskRepository.findById(taskId).ifPresent(task -> {
                 task.setPromotedAt(now);
                 taskRepository.save(task);

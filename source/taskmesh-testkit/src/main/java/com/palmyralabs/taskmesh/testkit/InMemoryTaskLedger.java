@@ -27,4 +27,9 @@ public class InMemoryTaskLedger implements TaskLedger {
     public void rerun(TaskRef taskRef) {
         store.rerun(taskRef);
     }
+
+    @Override
+    public int attemptCount(TaskRef taskRef) {
+        return store.attemptCount(taskRef);
+    }
 }

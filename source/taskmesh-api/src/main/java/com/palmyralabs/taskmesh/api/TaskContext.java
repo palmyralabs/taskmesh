@@ -4,6 +4,9 @@ public interface TaskContext {
 
     TaskRef taskRef();
 
+    /** The current attempt's own number — 1 for a task's first attempt, incrementing on each retry. */
+    int attemptNumber();
+
     Object payload();
 
     /**
