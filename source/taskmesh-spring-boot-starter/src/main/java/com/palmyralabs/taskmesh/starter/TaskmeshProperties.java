@@ -1,5 +1,6 @@
 package com.palmyralabs.taskmesh.starter;
 
+import com.palmyralabs.taskmesh.impl.ExponentialBackoffRetryPolicy.Jitter;
 import lombok.Getter;
 import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -28,6 +29,7 @@ public class TaskmeshProperties {
     private int maxAttempts = 10;
     private long backoffBaseMinutes = 2;
     private long backoffCapMinutes = 60;
+    private Jitter backoffJitter = Jitter.NONE;
 
     private int workerPoolSize = 8;
     private int batchSize = 500;

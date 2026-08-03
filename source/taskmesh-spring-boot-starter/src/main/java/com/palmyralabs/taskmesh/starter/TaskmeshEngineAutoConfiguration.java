@@ -68,7 +68,8 @@ public class TaskmeshEngineAutoConfiguration {
     @ConditionalOnMissingBean
     public RetryPolicy retryPolicy(TaskmeshProperties properties) {
         return new ExponentialBackoffRetryPolicy(properties.getMaxAttempts(),
-                Duration.ofMinutes(properties.getBackoffBaseMinutes()), Duration.ofMinutes(properties.getBackoffCapMinutes()));
+                Duration.ofMinutes(properties.getBackoffBaseMinutes()), Duration.ofMinutes(properties.getBackoffCapMinutes()),
+                properties.getBackoffJitter());
     }
 
     @Bean

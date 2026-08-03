@@ -208,7 +208,8 @@ public final class TaskmeshProfileBuilder {
                 : properties.getNodeId().isBlank() ? new DefaultNodeInfoProvider() : properties::getNodeId;
         RetryPolicy resolvedRetryPolicy = retryPolicy != null ? retryPolicy
                 : new ExponentialBackoffRetryPolicy(properties.getMaxAttempts(),
-                        Duration.ofMinutes(properties.getBackoffBaseMinutes()), Duration.ofMinutes(properties.getBackoffCapMinutes()));
+                        Duration.ofMinutes(properties.getBackoffBaseMinutes()), Duration.ofMinutes(properties.getBackoffCapMinutes()),
+                        properties.getBackoffJitter());
         MetricsReporter resolvedMetricsReporter = metricsReporter != null ? metricsReporter : new Slf4jMetricsReporter();
         IncidentStore resolvedIncidentStore = incidentStoreOverride != null ? incidentStoreOverride
                 : new JpaIncidentStore(incidentRepository);
