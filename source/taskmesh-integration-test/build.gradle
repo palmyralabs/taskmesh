@@ -8,6 +8,7 @@ configurations.testRuntimeClasspath {
 
 dependencies {
     testImplementation project(':taskmesh-spring-boot-starter')
+    testImplementation project(':taskmesh-simple')
     testImplementation 'org.springframework.boot:spring-boot-starter-test:3.3.4'
     testRuntimeOnly 'com.h2database:h2:2.2.224'
 }

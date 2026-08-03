@@ -1,0 +1,341 @@
+package com.palmyralabs.taskmesh.max;
+import com.palmyralabs.taskmesh.max.entity.PartitionedTaskId;
+import com.palmyralabs.taskmesh.max.entity.TaskId;
+import com.palmyralabs.taskmesh.max.entity.TaskStatus;
+import com.palmyralabs.taskmesh.max.entity.TmInFlightEntity;
+import com.palmyralabs.taskmesh.max.entity.TmTaskEntity;
+import com.palmyralabs.taskmesh.max.repository.TmInFlightRepository;
+import com.palmyralabs.taskmesh.max.repository.TmTaskRepository;
+
+import com.palmyralabs.taskmesh.api.ClaimOutcome;
+import com.palmyralabs.taskmesh.api.ReleaseOutcome;
+import com.palmyralabs.taskmesh.api.ReleaseRequest;
+import com.palmyralabs.taskmesh.api.TaskRef;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Exercises PartitionedTaskLedger's 3-window (reclaim/affinity/timeout) claim
+ * model (D27) against real H2, now split across the cold {@code tm_task}
+ * table and the hot {@code tm_in_flight} table (D-in_flight) — the SQL was
+ * hand-translated from palmyra76/workflow's fixed claim UPDATE and had never
+ * actually run before this test existed. {@code partitionKey} is required at
+ * this tier (D32) — every {@link TaskRef} below carries one.
+ */
+@DataJpaTest
+class PartitionedTaskLedgerTest {
+
+    private static final String P = "P1";
+
+    @Autowired
+    private TmTaskRepository taskRepository;
+
+    @Autowired
+    private TmInFlightRepository inFlightRepository;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    private TransactionTemplate transactionTemplate;
+    private PartitionedTaskLedger node1;
+    private PartitionedTaskLedger node2;
+    private NoopBacklogPromoter backlogPromoter;
+
+    @BeforeEach
+    void setUp() {
+        transactionTemplate = new TransactionTemplate(transactionManager);
+        backlogPromoter = new NoopBacklogPromoter(taskRepository, inFlightRepository, transactionTemplate);
+        node1 = ledgerFor("node-1");
+        node2 = ledgerFor("node-2");
+    }
+
+    /** This tier's enqueue() only writes tm_task — mirrors what the engine does by also calling onEnqueue. */
+    private void enqueueAndPromote(PartitionedTaskLedger ledger, TaskRef taskRef, String nodeId) {
+        ledger.enqueue(taskRef);
+        backlogPromoter.onEnqueue(taskRef, nodeId);
+    }
+
+    // leaseDuration=5min, reclaimWindow=30s (write-min only, never eligibility),
+    // affinityWindow=60s, claimTimeout=10min, reservationWindow=60s.
+    private PartitionedTaskLedger ledgerFor(String nodeId) {
+        return new PartitionedTaskLedger(taskRepository, inFlightRepository, transactionTemplate, () -> nodeId,
+                new ExponentialBackoffRetryPolicy(3, Duration.ofMillis(1), Duration.ofMillis(1)),
+                Duration.ofMinutes(5), Duration.ofSeconds(30), Duration.ofSeconds(60), Duration.ofMinutes(10),
+                Duration.ofSeconds(60));
+    }
+
+    private TmInFlightEntity inFlightRow(TaskRef taskRef) {
+        return inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId())).orElseThrow();
+    }
+
+    private TmTaskEntity taskRow(TaskRef taskRef) {
+        return taskRepository.findById(new PartitionedTaskId(taskRef.taskType(), taskRef.taskId(), taskRef.partitionKey())).orElseThrow();
+    }
+
+    /**
+     * Simulates "this hot row is from way in the past, ready to be picked up
+     * now" — backdates the hot row's updatedAt (which drives the reservation/
+     * affinity/claim-timeout windows) and clears its nextRetryAt (rather than
+     * relying on the retry policy's real, tiny backoff window elapsing in
+     * wall-clock time, which made an earlier version of this suite flaky).
+     */
+    private void backdateUpdatedAt(TaskRef taskRef, Instant when) {
+        transactionTemplate.executeWithoutResult(status -> {
+            TmInFlightEntity row = inFlightRow(taskRef);
+            row.setUpdatedAt(when);
+            row.setNextRetryAt(null);
+            inFlightRepository.save(row);
+        });
+    }
+
+    @Test
+    void claimWinsForFirstNodeAndLosesForSecond() {
+        TaskRef taskRef = new TaskRef("T", "1", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+
+        assertEquals(ClaimOutcome.WON, node1.claim(taskRef));
+        assertEquals(ClaimOutcome.LOST, node2.claim(taskRef));
+    }
+
+    @Test
+    void completedReleaseMakesTaskUnclaimableAgainAndDeletesHotRow() {
+        TaskRef taskRef = new TaskRef("T", "2", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+        node1.claim(taskRef);
+
+        assertEquals(ReleaseOutcome.OK, node1.release(taskRef, ReleaseRequest.completed()));
+        assertEquals(ClaimOutcome.LOST, node2.claim(taskRef));
+
+        assertEquals(TaskStatus.COMPLETED, taskRow(taskRef).getStatus());
+        assertTrue(inFlightRepository.findById(new TaskId("T", "2")).isEmpty(), "terminal release must delete the hot row");
+    }
+
+    @Test
+    void requeueReleaseSetsReleasedStatusAndSameNodeCanReclaimWithinAffinity() {
+        TaskRef taskRef = new TaskRef("T", "3", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+        node1.claim(taskRef);
+
+        assertEquals(ReleaseOutcome.OK, node1.release(taskRef, ReleaseRequest.requeue("TRANSIENT", "boom")));
+
+        TmInFlightEntity row = inFlightRow(taskRef);
+        assertEquals(TaskStatus.RELEASED, row.getStatus());
+        assertEquals("node-1", row.getNodeId(), "node_id must NOT be cleared on requeue — it's the affinity key");
+        assertEquals(TaskStatus.QUEUED, taskRow(taskRef).getStatus(), "cold row stays QUEUED throughout — CLAIMED/RELEASED never appear there");
+
+        // Still within the affinity window (60s) — same node can reclaim immediately.
+        assertEquals(ClaimOutcome.WON, node1.claim(taskRef));
+    }
+
+    @Test
+    void requeueReleaseBlocksOtherNodesWithinAffinityWindow() {
+        TaskRef taskRef = new TaskRef("T", "4", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+        node1.claim(taskRef);
+        node1.release(taskRef, ReleaseRequest.requeue("TRANSIENT", "boom"));
+
+        // Fresh RELEASED row, still within the 60s affinity window — node2 must NOT win.
+        assertEquals(ClaimOutcome.LOST, node2.claim(taskRef));
+    }
+
+    @Test
+    void requeueReleaseAllowsOtherNodesOnceAffinityExpires() {
+        TaskRef taskRef = new TaskRef("T", "5", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+        node1.claim(taskRef);
+        node1.release(taskRef, ReleaseRequest.requeue("TRANSIENT", "boom"));
+
+        backdateUpdatedAt(taskRef, Instant.now().minus(Duration.ofMinutes(5))); // past the 60s affinity window
+
+        assertEquals(ClaimOutcome.WON, node2.claim(taskRef));
+    }
+
+    @Test
+    void staleClaimIsStolenAfterClaimTimeout() {
+        TaskRef taskRef = new TaskRef("T", "6", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+        node1.claim(taskRef); // simulates node-1, which then "crashes" — never releases
+
+        backdateUpdatedAt(taskRef, Instant.now().minus(Duration.ofMinutes(20))); // past the 10min claimTimeout
+
+        assertEquals(ClaimOutcome.WON, node2.claim(taskRef));
+    }
+
+    @Test
+    void freshClaimIsNotStealableBeforeClaimTimeout() {
+        TaskRef taskRef = new TaskRef("T", "7", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+        node1.claim(taskRef);
+
+        assertEquals(ClaimOutcome.LOST, node2.claim(taskRef));
+    }
+
+    @Test
+    void exhaustionEscalatesToFailedAndDeletesHotRow() {
+        TaskRef taskRef = new TaskRef("T", "8", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+
+        // maxAttempts=3 on the retry policy: 1st and 2nd requeue succeed (attempt 1, 2),
+        // the 3rd attempt (attempt 3) is still <= 3 so it succeeds too; the 4th exhausts.
+        for (int i = 0; i < 3; i++) {
+            node1.claim(taskRef);
+            assertEquals(ReleaseOutcome.OK, node1.release(taskRef, ReleaseRequest.requeue("BOOM", "fail " + i)));
+            backdateUpdatedAt(taskRef, Instant.now().minus(Duration.ofMinutes(5)));
+        }
+        node1.claim(taskRef);
+        assertEquals(ReleaseOutcome.EXHAUSTED, node1.release(taskRef, ReleaseRequest.requeue("BOOM", "final fail")));
+
+        assertEquals(TaskStatus.FAILED, taskRow(taskRef).getStatus());
+        assertTrue(inFlightRepository.findById(new TaskId("T", "8")).isEmpty(), "exhaustion is terminal — hot row must be deleted");
+    }
+
+    @Test
+    void pullPendingMirrorsClaimEligibilityForTheQueryingNode() {
+        TaskRef queued = new TaskRef("T", "9", P);
+        TaskRef claimedByNode1Fresh = new TaskRef("T", "10", P);
+        TaskRef claimedByNode1Stale = new TaskRef("T", "11", P);
+        TaskRef releasedByNode1Fresh = new TaskRef("T", "12", P);
+        TaskRef releasedByNode1Stale = new TaskRef("T", "13", P);
+
+        for (TaskRef ref : List.of(queued, claimedByNode1Fresh, claimedByNode1Stale, releasedByNode1Fresh, releasedByNode1Stale)) {
+            enqueueAndPromote(node1, ref, "node-1");
+        }
+
+        node1.claim(claimedByNode1Fresh);
+        node1.claim(claimedByNode1Stale);
+        backdateUpdatedAt(claimedByNode1Stale, Instant.now().minus(Duration.ofMinutes(20)));
+
+        node1.claim(releasedByNode1Fresh);
+        node1.release(releasedByNode1Fresh, ReleaseRequest.requeue("X", "x"));
+
+        node1.claim(releasedByNode1Stale);
+        node1.release(releasedByNode1Stale, ReleaseRequest.requeue("X", "x"));
+        backdateUpdatedAt(releasedByNode1Stale, Instant.now().minus(Duration.ofMinutes(5)));
+
+        // queued was enqueued by node1 (reserved to it) — age it past the reservation window so node2 can see it.
+        backdateUpdatedAt(queued, Instant.now().minus(Duration.ofMinutes(5)));
+
+        List<TaskRef> node2Pending = node2.pullPending("T", Instant.now(), 100);
+
+        assertTrue(node2Pending.contains(queued), "QUEUED past its reservation window is open to any node");
+        assertTrue(node2Pending.contains(claimedByNode1Stale), "stale claim (past claimTimeout) must be stealable");
+        assertTrue(node2Pending.contains(releasedByNode1Stale), "released past affinity must be open to any node");
+        assertFalse(node2Pending.contains(claimedByNode1Fresh), "fresh claim by another node must not be offered");
+        assertFalse(node2Pending.contains(releasedByNode1Fresh), "released within affinity must not be offered to another node");
+    }
+
+    @Test
+    void enqueueIsIdempotentAndDoesNotResetAnInProgressRow() {
+        TaskRef taskRef = new TaskRef("T", "14", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+        node1.claim(taskRef);
+
+        enqueueAndPromote(node1, taskRef, "node-1"); // re-enqueue while claimed — must not reset status/ownership
+
+        TmInFlightEntity row = inFlightRow(taskRef);
+        assertEquals(TaskStatus.CLAIMED, row.getStatus());
+        assertEquals("node-1", row.getNodeId());
+        assertEquals(TaskStatus.QUEUED, taskRow(taskRef).getStatus());
+    }
+
+    @Test
+    void enqueuePlusNoopPromoterCreatesBothColdAndHotRowsTogether() {
+        // Unlike taskmesh-simple/-pro, this tier's enqueue() alone only writes tm_task —
+        // NoopBacklogPromoter.onEnqueue (called by the engine right after) is what
+        // reproduces the historical eager-pair behavior; see enqueueAndPromote().
+        TaskRef taskRef = new TaskRef("T", "15", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+
+        assertEquals(TaskStatus.QUEUED, taskRow(taskRef).getStatus());
+        Optional<TmInFlightEntity> hot = inFlightRepository.findById(new TaskId("T", "15"));
+        assertTrue(hot.isPresent(), "enqueue+onEnqueue must create the hot row eagerly, not lazily on first claim");
+        assertEquals(TaskStatus.QUEUED, hot.get().getStatus(), "the hot row is reserved (QUEUED) to the enqueuing node");
+        assertEquals("node-1", hot.get().getNodeId(), "reservation keys on the enqueuing node's id");
+        assertEquals(P, hot.get().getPartitionKey(), "partitionKey must propagate onto the hot row too");
+    }
+
+    @Test
+    void reservedQueuedIsNotStealableByAnotherNodeWithinReservationWindow() {
+        TaskRef taskRef = new TaskRef("T", "16", P);
+        enqueueAndPromote(node1, taskRef, "node-1"); // QUEUED, reserved to node-1
+
+        assertEquals(ClaimOutcome.LOST, node2.claim(taskRef), "a fresh reservation must not be stealable by another node");
+        assertEquals(ClaimOutcome.WON, node1.claim(taskRef), "the reserving node claims its own work immediately");
+    }
+
+    @Test
+    void reservedQueuedBecomesStealableAfterReservationWindow() {
+        TaskRef taskRef = new TaskRef("T", "17", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+
+        backdateUpdatedAt(taskRef, Instant.now().minus(Duration.ofMinutes(5))); // past the 60s reservation window
+
+        assertEquals(ClaimOutcome.WON, node2.claim(taskRef), "past the reservation window, any node may steal a still-QUEUED row");
+    }
+
+    @Test
+    void rerunRecreatesTheHotRowForATerminallyFailedTaskAndMakesItClaimableAgain() {
+        TaskRef taskRef = new TaskRef("T", "18", P);
+        enqueueAndPromote(node1, taskRef, "node-1");
+        node1.claim(taskRef);
+        node1.release(taskRef, ReleaseRequest.failedTerminal("BOOM", "dead")); // terminal — deletes the hot row
+
+        assertEquals(TaskStatus.FAILED, taskRow(taskRef).getStatus());
+        assertTrue(inFlightRepository.findById(new TaskId("T", "18")).isEmpty(), "terminal deleted the hot row");
+
+        node1.rerun(taskRef);
+
+        TmInFlightEntity hot = inFlightRow(taskRef);
+        assertEquals(TaskStatus.QUEUED, hot.getStatus(), "rerun recreates the hot row, reserved and QUEUED");
+        assertEquals(0, hot.getAttemptCount(), "rerun clears the retry counter");
+        assertEquals(TaskStatus.QUEUED, taskRow(taskRef).getStatus(), "cold row forced back to QUEUED");
+        assertEquals(ClaimOutcome.WON, node1.claim(taskRef), "reran task is claimable again");
+    }
+
+    @Test
+    void rerunIsANoOpForANeverEnqueuedTask() {
+        TaskRef unknown = new TaskRef("T", "19", P);
+        node1.rerun(unknown);
+
+        assertTrue(inFlightRepository.findById(new TaskId("T", "19")).isEmpty(),
+                "rerun must not fabricate a hot row without a cold ledger row (pair invariant)");
+    }
+
+    // ---- D32: partitionKey is required, hard-fail (not a default bucket) on missing ----
+
+    @Test
+    void enqueueThrowsOnMissingPartitionKey() {
+        TaskRef noPartition = new TaskRef("T", "20");
+        assertThrows(IllegalArgumentException.class, () -> node1.enqueue(noPartition));
+    }
+
+    @Test
+    void rerunThrowsOnMissingPartitionKey() {
+        TaskRef noPartition = new TaskRef("T", "21");
+        assertThrows(IllegalArgumentException.class, () -> node1.rerun(noPartition));
+    }
+
+    // NOTE: (taskType, taskId) must map to exactly one, stable partitionKey — that's a
+    // caller contract (D32: "partitionKey must be stable across repeated enqueue calls
+    // for the same task_id"), not something this ledger enforces. tm_task's PK technically
+    // admits two different partitionKey values for the same (taskType, taskId), but
+    // tm_in_flight's PK does NOT include partitionKey (D32 — deliberately unpartitioned),
+    // so a caller violating that contract gets an inconsistent, unsupported state (the
+    // second enqueue's hot row silently no-ops against NoopBacklogPromoter's "only if
+    // absent" guard). Not covered by a test — it's a documented caller responsibility,
+    // not a scenario this ledger is designed to handle gracefully.
+}

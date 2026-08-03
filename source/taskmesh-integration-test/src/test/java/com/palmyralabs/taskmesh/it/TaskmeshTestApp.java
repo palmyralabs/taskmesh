@@ -6,7 +6,7 @@ import com.palmyralabs.taskmesh.api.RetryPolicy;
 import com.palmyralabs.taskmesh.api.TaskContext;
 import com.palmyralabs.taskmesh.api.TaskProcessor;
 import com.palmyralabs.taskmesh.exception.NonRetryableException;
-import com.palmyralabs.taskmesh.impl.ExponentialBackoffRetryPolicy;
+import com.palmyralabs.taskmesh.simple.ExponentialBackoffRetryPolicy;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.jdbc.DataSourceTransactionManagerAutoConfiguration;
 import org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration;

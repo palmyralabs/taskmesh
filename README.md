@@ -18,9 +18,11 @@ Gradle build (Java 17):
 - `taskmesh-api` — interfaces + domain types only (JDK + SLF4J).
 - `taskmesh-engine` — the driving implementation (feeder, claim loop, dispatcher,
   worker pool); plain Java, no Spring.
-- `taskmesh-impl` — JPA-backed persistence of the `-api` contracts (the `tm_*`
-  tables; see [`docs/schema.md`](docs/schema.md)).
-- `taskmesh-spring-boot-starter` — optional Spring Boot auto-configuration.
+- `taskmesh-simple` / `taskmesh-pro` / `taskmesh-max` — three independent,
+  JPA-backed persistence tiers for the `-api` contracts (own `tm_*` tables
+  each; see [`docs/schema.md`](docs/schema.md)) — pick exactly one.
+- `taskmesh-spring-boot-starter` — optional, tier-agnostic Spring Boot config
+  surface; each tier ships its own auto-configuration.
 - `taskmesh-testkit` — in-memory fakes for unit-testing a `TaskProcessor`.
 
 Build and test from `source/`: `./gradlew build`.

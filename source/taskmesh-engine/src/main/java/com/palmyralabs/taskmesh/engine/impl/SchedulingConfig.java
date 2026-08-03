@@ -35,6 +35,14 @@ public class SchedulingConfig {
     @Builder.Default
     private int safetyNetPollSeconds = 30;
 
+    /** BacklogPromoter.promote() batch size per task type, per cycle. */
+    @Builder.Default
+    private int backlogBatchSize = 50;
+
+    /** BacklogPromoter.promote() poll interval. */
+    @Builder.Default
+    private int backlogIntervalSeconds = 5;
+
     /** Fixed capacity of the execution queue's priorityArray (D25). A constant for now, per that decision. */
     public static final int PRIORITY_QUEUE_CAPACITY = 5;
 

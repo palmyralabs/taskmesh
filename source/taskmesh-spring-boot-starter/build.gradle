@@ -2,11 +2,16 @@ configurations.testRuntimeClasspath {
     exclude group: 'org.slf4j', module: 'slf4j-simple'
 }
 
+// Deliberately no dependency on any taskmesh-simple/-pro/-max tier module —
+// this is the tier-agnostic config/defaults surface (TaskmeshProperties,
+// WorkloadProfile, Slf4jMetricsReporter, SingleProviderPayloadProviderFactory)
+// that each tier module depends on, not the other way around. Each tier ships
+// its own @AutoConfiguration classes and AutoConfiguration.imports — a
+// consumer's choice of exactly one tier module on the classpath is what
+// selects which tier auto-configures, no @ConditionalOnClass needed here.
 dependencies {
-    api project(':taskmesh-impl')
+    api project(':taskmesh-api')
     api 'org.springframework.boot:spring-boot-autoconfigure:3.3.4'
-    implementation 'org.springframework.boot:spring-boot-starter-data-jpa:3.3.4'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test:3.3.4'
-    testRuntimeOnly 'com.h2database:h2:2.2.224'
 }

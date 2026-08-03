@@ -9,6 +9,7 @@ import com.palmyralabs.taskmesh.api.TypedTaskProcessor;
 import com.palmyralabs.taskmesh.engine.impl.SchedulingConfig;
 import com.palmyralabs.taskmesh.testkit.FixedDelayRetryPolicy;
 import com.palmyralabs.taskmesh.testkit.InMemoryAuditEventSink;
+import com.palmyralabs.taskmesh.testkit.InMemoryBacklogPromoter;
 import com.palmyralabs.taskmesh.testkit.InMemoryClaimStrategy;
 import com.palmyralabs.taskmesh.testkit.InMemoryHeartbeatStrategy;
 import com.palmyralabs.taskmesh.testkit.InMemoryHistoryWriter;
@@ -83,6 +84,7 @@ class TaskMeshEngineIntegrationTest {
                 .claimStrategy(claimStrategy)
                 .heartbeatStrategy(heartbeatStrategy)
                 .taskLedger(taskLedger)
+                .backlogPromoter(new InMemoryBacklogPromoter())
                 .pauseController(pauseController)
                 .historyWriter(historyWriter)
                 .auditEventSink(auditEventSink)
@@ -145,6 +147,7 @@ class TaskMeshEngineIntegrationTest {
                 .claimStrategy(claimStrategy)
                 .heartbeatStrategy(heartbeatStrategy)
                 .taskLedger(taskLedger)
+                .backlogPromoter(new InMemoryBacklogPromoter())
                 .pauseController(pauseController)
                 .historyWriter(historyWriter)
                 .auditEventSink(auditEventSink)
@@ -172,6 +175,59 @@ class TaskMeshEngineIntegrationTest {
         assertFalse(incidentStore.openIncidents().isEmpty());
         assertFalse(metricsReporter.failures().isEmpty());
         assertTrue(metricsReporter.retries().size() >= 2);
+    }
+
+    @Test
+    void adjustPoolSizeResizesWithinBuiltCeilingAndIgnoresOutOfRangeRequests() throws Exception {
+        NodeInfoProvider nodeInfoProvider = () -> "node-1";
+        InMemoryTaskStore store = new InMemoryTaskStore();
+        InMemoryClaimStrategy claimStrategy = new InMemoryClaimStrategy(
+                store, nodeInfoProvider, new FixedDelayRetryPolicy(3, Duration.ofMillis(10)));
+        InMemoryHeartbeatStrategy heartbeatStrategy = new InMemoryHeartbeatStrategy(claimStrategy);
+        InMemoryTaskLedger taskLedger = new InMemoryTaskLedger(store);
+
+        TaskProcessor processor = new TaskProcessor() {
+            @Override
+            public String taskType() {
+                return "NOOP";
+            }
+
+            @Override
+            public void process(TaskContext ctx) {
+            }
+        };
+
+        TaskMeshEngine engine = TaskMeshEngine.builder()
+                .nodeInfoProvider(nodeInfoProvider)
+                .processors(List.of(processor))
+                .claimStrategy(claimStrategy)
+                .heartbeatStrategy(heartbeatStrategy)
+                .taskLedger(taskLedger)
+                .backlogPromoter(new InMemoryBacklogPromoter())
+                .pauseController(new InMemoryPauseController())
+                .historyWriter(new InMemoryHistoryWriter())
+                .auditEventSink(new InMemoryAuditEventSink())
+                .incidentStore(new InMemoryIncidentStore())
+                .metricsReporter(new InMemoryMetricsReporter())
+                .payloadProviderFactory(new SingleProviderPayloadProviderFactory(new InMemoryPayloadStore()))
+                .schedulingConfig(SchedulingConfig.builder().workerPoolSize(8).queryIntervalSeconds(1).build())
+                .build();
+
+        assertEquals(8, engine.currentPoolSize());
+
+        engine.adjustPoolSize(3);
+        assertEquals(3, engine.currentPoolSize());
+
+        engine.adjustPoolSize(6);
+        assertEquals(6, engine.currentPoolSize());
+
+        // above the built ceiling (8) clamps down to it, not rejected/ignored
+        engine.adjustPoolSize(100);
+        assertEquals(8, engine.currentPoolSize());
+
+        // below 1 clamps up to 1, never zero
+        engine.adjustPoolSize(0);
+        assertEquals(1, engine.currentPoolSize());
     }
 
     private static void waitUntil(BooleanSupplier condition) throws InterruptedException {

@@ -1,12 +1,35 @@
-# taskmesh-impl: `tm_*` table reference
+# `tm_*` table reference
 
-This document describes the six tables owned by `taskmesh-impl` (package
-`com.palmyralabs.taskmesh.impl`, entities under `.entity`, repositories
-under `.repository` — D29) — the JPA-backed persistence implementation of
-taskmesh's `-api` contracts (`TaskLedger`, `ClaimStrategy`, `HeartbeatStrategy`,
-`HistoryWriter`, `AuditEventSink`, `IncidentStore`, `PauseController`), now
-housing all three workload profiles (BATCH/HIGH_VOLUME/REACTIVE) rather than
-just HIGH_VOLUME.
+This document describes the seven tables owned by each of the three persistence
+tiers — `taskmesh-simple`/`taskmesh-pro`/`taskmesh-max` (packages
+`com.palmyralabs.taskmesh.simple`/`.pro`/`.max`, entities under `.entity`,
+repositories under `.repository` — D29) — the JPA-backed persistence
+implementation of taskmesh's `-api` contracts (`TaskLedger`, `ClaimStrategy`,
+`HeartbeatStrategy`, `HistoryWriter`, `AuditEventSink`, `IncidentStore`,
+`PauseController`, `BacklogPromoter`), each housing all three workload profiles
+(BATCH/HIGH_VOLUME/REACTIVE) rather than just HIGH_VOLUME.
+
+> **D31 — three independent tiers, not one `taskmesh-impl`.** Each tier owns
+> its own copy of these tables (own entities, repositories, DDL) — deliberately
+> not shared, so a tier-specific schema change (e.g. `taskmesh-max`'s
+> `promoted_at`) can never leak into another tier.
+>
+> **D32 — `taskmesh-max` only: `partition_key`, caller-supplied and required.**
+> `tm_task`, `tm_in_flight`, `tm_history_event`, `tm_incident`, and
+> `tm_attempt_history` all gain a `partition_key` column at this tier —
+> `PartitionedTaskLedger` (this tier's only `ClaimStrategy`/`TaskLedger`; there
+> is no single-node variant here) throws on `enqueue()`/`rerun()` if it's
+> missing, rather than defaulting to an unpartitioned bucket. It's part of the
+> **primary key** on four of those five tables (Postgres requires the
+> partition column in every unique constraint on a table you physically
+> partition) — the one exception is `tm_in_flight`, where it's a plain column
+> only, since that table is never physically partitioned (the feeder-throttled
+> `JpaBacklogPromoter` design keeps it bounded regardless). `tm_audit_event` is
+> explicitly **excluded** — deferred, revisited separately. taskmesh ships
+> zero partitioning opinion (no `PARTITION BY`, no scheme, no modulus) — see
+> the DDL notes below and `docs/planning/decisions.md`'s D32 entry.
+>
+> The table shapes below are otherwise identical across all three tiers.
 
 Applications embedding taskmesh (via `MultiNodeTaskLedger` or
 `SimpleTaskLedger`) never write to these tables directly — the engine and its
@@ -75,6 +98,14 @@ Postgres-specific tuning).
 
 There is no `next_retry_at` here — the backoff gate moved to `tm_in_flight`
 with the rest of the claim-driving state.
+
+**`taskmesh-max` only**: an additional nullable `promoted_at` column, `NULL`
+until `BacklogPromoter` creates the matching `tm_in_flight` row (immediately,
+under the default `NoopBacklogPromoter`; in bounded batches, under
+`JpaBacklogPromoter` — see D31). A partial index
+(`idx_tm_task_unpromoted ON tm_task (created_at) WHERE promoted_at IS NULL
+AND status = 'QUEUED'`) keeps `JpaBacklogPromoter`'s backlog scan cheap
+regardless of how much promoted/terminal history accumulates.
 
 ## `tm_in_flight` (hot)
 
@@ -174,6 +205,11 @@ is the table to query for "what happened to task X" over its full history.
 Query by `(task_type, task_id)` for a task's full timeline; there's an index
 on exactly that pair (`idx_tm_history_event_task` in the toolkit's DDL).
 
+**`taskmesh-max` only** (D32): a `partition_key` column, part of the PK
+alongside `id` — required, since `id`'s generation moves from `IDENTITY` to an
+explicit `SEQUENCE` there (Hibernate doesn't support `IDENTITY` inside a
+composite `@IdClass` key).
+
 ## `tm_audit_event`
 
 Operator-triggered and cluster-level events only — **not** routine per-task
@@ -195,6 +231,11 @@ This is the table to point a compliance/audit view at — it's deliberately
 small-volume (operator actions only), unlike `tm_history_event` which grows
 with every task attempt.
 
+**Not touched by D32** — no `partition_key` here in any tier. Deferred
+(revisited separately), mainly because of the nullable-`task_id` cluster-wide
+event case (`PAUSE_REQUESTED`/`RESUME_REQUESTED` have no task, so no natural
+partition key either).
+
 ## `tm_incident`
 
 Terminally-failed tasks that need a human to look at them — written by
@@ -215,6 +256,27 @@ the raw state, not a triaged queue).
 A partial index on open incidents (`WHERE resolved_at IS NULL`) keeps the
 "what's currently broken" query cheap regardless of how much resolved history
 accumulates — see `idx_tm_incident_open` in the toolkit's DDL.
+
+**`taskmesh-max` only** (D32): same `partition_key`-joins-`id`-in-the-PK
+treatment as `tm_history_event` above, same `SEQUENCE`-not-`IDENTITY` reason.
+
+## `tm_attempt_history`
+
+BATCH profile's coarse alternative to `tm_history_event` (`AttemptHistoryWriter`)
+— one row per `(task_type, task_id, attempt_number)`, upserted in place
+(`INSERT` on `STARTED`, `UPDATE` on the attempt's terminal outcome) rather
+than append-only.
+
+| Column | Notes |
+|---|---|
+| `task_type`, `task_id`, `attempt_number` (PK) | One row per attempt — the composite key is load-bearing: `AttemptHistoryWriter` looks up by it to decide insert vs. update. |
+| `status` | Last `HistoryEventType` recorded for the attempt. |
+| `started_at`, `ended_at` | `ended_at` set only on a terminal outcome. |
+| `detail` | Free-text detail. |
+
+**`taskmesh-max` only** (D32): `partition_key` joins the PK (now four
+columns) — required, since this table is physically partitioned at this tier
+and Postgres requires the partition column in every unique constraint.
 
 ## `tm_control_flag`
 

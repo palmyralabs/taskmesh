@@ -1,6 +1,6 @@
 package com.palmyralabs.taskmesh.starter;
 
-import com.palmyralabs.taskmesh.impl.ExponentialBackoffRetryPolicy.Jitter;
+import com.palmyralabs.taskmesh.api.Jitter;
 import lombok.Getter;
 import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;

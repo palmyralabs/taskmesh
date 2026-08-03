@@ -23,56 +23,82 @@ first build needs network access.
 ```bash
 cd source
 ./gradlew build                 # compile + test everything (gradlew.bat on Windows)
-./gradlew :taskmesh-impl:test   # test one module
+./gradlew :taskmesh-simple:test # test one module (or :taskmesh-pro:test / :taskmesh-max:test)
 ./gradlew :taskmesh-engine:test # etc.
 
 # Run a single test class / method (JUnit 5):
-./gradlew :taskmesh-impl:test --tests 'com.palmyralabs.taskmesh.impl.MultiNodeTaskLedgerTest'
-./gradlew :taskmesh-impl:test --tests '*MultiNodeTaskLedgerTest.claimSingleWinner'
+./gradlew :taskmesh-simple:test --tests 'com.palmyralabs.taskmesh.simple.MultiNodeTaskLedgerTest'
+./gradlew :taskmesh-simple:test --tests '*MultiNodeTaskLedgerTest.claimSingleWinner'
 ```
 
-Tests use JUnit 5 + Lombok. JPA tests (`taskmesh-impl`, `-spring-boot-starter`) run against
+Tests use JUnit 5 + Lombok. JPA tests (`taskmesh-simple`/`-pro`/`-max`) run against
 in-memory **H2**, not Postgres — see the Postgres note below for behaviors H2 does not catch.
 
 ## Module architecture
 
 Dependency direction is strictly one-way; `-api` is the stable core everything compiles against.
+Persistence is **three fully-independent tiers** (D31) rather than one `taskmesh-impl` — a
+consumer depends on exactly one of them, never more than one.
 
 ```
 consumer's TaskProcessor impls
         │  ▼
   taskmesh-engine ──▶ taskmesh-api         (plain Java, ExecutorService-based; NO Spring, NO JDBC)
         ▲                  ▲
-  taskmesh-impl ───────────┘               (JPA/Spring Data persistence of the -api contracts)
+  taskmesh-simple ─────────┤  ┐
+  taskmesh-pro ────────────┤  ├─ pick exactly one (own JPA entities/repos/DDL each, D31)
+  taskmesh-max ────────────┘  ┘
         ▲
-  taskmesh-spring-boot-starter             (optional auto-config; a non-Spring consumer wires -engine directly)
+  taskmesh-spring-boot-starter             (tier-agnostic: TaskmeshProperties/WorkloadProfile/
+        ▲                                   Slf4jMetricsReporter — depends on NO tier, D31)
   taskmesh-testkit ──▶ taskmesh-api        (in-memory fakes of every interface, for unit-testing a processor)
 ```
 
-- **`taskmesh-api`** — interfaces + domain types only, JDK + SLF4J. The ~35 interfaces here
-  (`TaskProcessor`, `TaskContext`, `ClaimStrategy`, `TaskLedger`, `HeartbeatStrategy`,
-  `FailureClassifier`, `RetryPolicy`, `HistoryWriter`, `AuditEventSink`, `IncidentStore`,
-  `PauseController`, `ProcessorRegistry`, `PayloadProvider`, `TimeoutPolicy`, `MetricsReporter`)
-  are the extension seams.
+- **`taskmesh-api`** — interfaces + domain types only, JDK + SLF4J. The extension-seam
+  interfaces (`TaskProcessor`, `TaskContext`, `ClaimStrategy`, `TaskLedger`, `BacklogPromoter`,
+  `HeartbeatStrategy`, `FailureClassifier`, `RetryPolicy`, `HistoryWriter`, `AuditEventSink`,
+  `IncidentStore`, `PauseController`, `ProcessorRegistry`, `PayloadProvider`, `TimeoutPolicy`,
+  `MetricsReporter`) live here, plus tier-agnostic shared types like `Jitter`.
 - **`taskmesh-engine`** — the one "driving implementation": feeder/poller, claim loop,
-  dispatcher, worker pool. `TaskMeshEngine` (interface, built via `TaskMeshEngine.builder()`)
-  is the public entry point; `TaskMeshEngineImpl` and everything else lives under `engine.impl`
-  and must not be referenced directly. **The engine never branches on single-node vs multi-node**
-  — topology is entirely a `ClaimStrategy`/`HeartbeatStrategy`/`TaskLedger` implementation concern.
-  Zero Spring dependency.
-- **`taskmesh-impl`** — JPA-backed implementations (`Jpa*`, `MultiNodeTaskLedger`,
-  `SimpleTaskLedger`) of the persistence contracts, over the six `tm_*` tables. **This is the
-  real persistence module** — the planning docs' references to a separate `taskmesh-postgres`
-  module are historical; it was folded into `taskmesh-impl`.
-- **`taskmesh-spring-boot-starter`** — optional. Auto-configuration + `@ConfigurationProperties`
-  (`taskmesh.*`). Selecting a `WorkloadProfile` picks concrete implementation classes;
-  `ProfileFactories` is the single interfaces→implementations mapping shared by auto-config and
-  the manual `TaskmeshProfileBuilder`, so the two paths never drift.
-- **`taskmesh-testkit`** — in-memory `InMemory*`/`Fake*` impls of every `-api` interface for
-  unit-testing a `TaskProcessor` with no DB and no Spring context.
+  dispatcher, worker pool, and the `BacklogPromoter` promotion scheduler (its own
+  `ScheduledExecutorService`, mirrors the claim poller). `TaskMeshEngine` (interface, built via
+  `TaskMeshEngine.builder()`) is the public entry point; `TaskMeshEngineImpl` and everything else
+  lives under `engine.impl` and must not be referenced directly. **The engine never branches on
+  single-node vs multi-node, or on which tier is wired** — topology and hot-row-creation timing
+  are entirely `ClaimStrategy`/`HeartbeatStrategy`/`TaskLedger`/`BacklogPromoter` implementation
+  concerns. Zero Spring dependency.
+- **`taskmesh-simple` / `taskmesh-pro`** — JPA-backed implementations (`Jpa*`,
+  `MultiNodeTaskLedger`, `SimpleTaskLedger`) of the persistence contracts, each over its own copy
+  of the seven `tm_*` tables (own entities, repositories, DDL — deliberately duplicated, not
+  shared, per D31). `-simple` (small-scale, single-node default) and `-pro` (medium/large,
+  multi-node default) both always wire `NoopBacklogPromoter` (eager hot-row creation, unchanged
+  D28 behavior).
+- **`taskmesh-max`** — large-scale/partitioned tier. Ships only `PartitionedTaskLedger` (no
+  `SimpleTaskLedger` — partitioning is a multi-node/scale concept). `enqueue()` only writes
+  `tm_task`, deferring hot-row creation to the wired `BacklogPromoter` (`NoopBacklogPromoter`
+  still the default; `JpaBacklogPromoter` opt-in, throttles hot-row creation to bounded batches
+  via `promoted_at`). `partitionKey` (on the shared `TaskRef`, D32) is caller-supplied and
+  required at this tier — `enqueue()`/`rerun()` throw on a missing one, no default bucket. Five
+  tables (`tm_task`/`tm_in_flight`/`tm_history_event`/`tm_incident`/`tm_attempt_history`) carry
+  `partition_key`; `tm_audit_event` is deferred. taskmesh ships zero partitioning DDL opinion —
+  see D32.
+- **`taskmesh-spring-boot-starter`** — optional, and **tier-agnostic** (D31): just
+  `@ConfigurationProperties` (`TaskmeshProperties`, `taskmesh.*`), `WorkloadProfile`,
+  `Slf4jMetricsReporter`, `SingleProviderPayloadProviderFactory`. Zero dependency on any tier —
+  each tier depends on *it*, not the other way around, and ships its own
+  `<tier>.starter.{ProfileFactories,TaskmeshJpaAutoConfiguration,TaskmeshEngineAutoConfiguration,
+  TaskmeshProfileBuilder}` plus its own `AutoConfiguration.imports`. `ProfileFactories` is the
+  interfaces→implementations mapping (per `WorkloadProfile`) shared by a tier's auto-config and
+  its manual `TaskmeshProfileBuilder`, so the two paths never drift. No `@ConditionalOnClass`
+  tier-detection needed — whichever one tier module a consumer depends on is the only one whose
+  `AutoConfiguration.imports` is ever on the classpath.
+- **`taskmesh-testkit`** — in-memory `InMemory*`/`Fake*` impls of every `-api` interface
+  (including `InMemoryBacklogPromoter`) for unit-testing a `TaskProcessor` with no DB and no
+  Spring context.
 - **`taskmesh-integration-test`** — test-only module (no published artifact). Boots the whole
-  engine via the Spring Boot starter against in-memory H2 and drives real enqueue → claim →
-  process → release / incident / rerun flows end-to-end (`EngineEndToEndTest`).
+  engine via the Spring Boot starter (currently against `taskmesh-simple`) against in-memory H2
+  and drives real enqueue → claim → process → release / incident / rerun flows end-to-end
+  (`EngineEndToEndTest`).
 
 ## Non-negotiable design invariants
 

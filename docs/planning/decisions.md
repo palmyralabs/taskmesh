@@ -746,3 +746,166 @@ bodies specifically, not just rely on import statements resolving cleanly.
 **Rules out**: three `taskmesh-profile-*` sub-projects as the near-term
 packaging shape. Revisit only if a profile's dependencies genuinely diverge
 (a profile needing Kafka, say) — not before.
+
+## D30 — `TaskMeshEngine` gets a runtime pool-resize primitive; latency tracking and the resize *policy* stay entirely consumer-side
+
+The migration toolkit (HPE/LIC) wants backpressure-aware throttling: when
+source-query or target-upload latency degrades, shrink the migration
+worker pool; when it recovers, grow it back. Two ways to split this:
+(a) taskmesh owns a `LatencyTracker` abstraction and a backpressure
+controller that calls its own resize internally, or (b) taskmesh only
+exposes the mechanical capability (resize the pool) and the consumer
+owns measuring latency and deciding when/how much to resize.
+
+**Chose (b), per explicit instruction.** Latency is a domain signal (what
+counts as "source" vs "target" latency, what op to measure, PoC-rolling-average
+vs production-percentile) that has nothing to do with task orchestration —
+taskmesh stays domain-agnostic (per D2) even for its own operational tuning.
+`TaskMeshEngine` gains exactly two methods: `adjustPoolSize(int)` (bounded to
+`[1, the pool size the engine was built with]` — never scales past the
+configured ceiling) and `currentPoolSize()`. No `LatencyTracker` interface,
+no percentile/rolling-average implementations, no scheduled backpressure
+controller — those all belong in the consuming app (`emgr-*` in the
+migration toolkit repo), built against this resize primitive.
+
+**Rules out**: a `taskmesh-backpressure` module, a `MetricsReporter`
+extension for latency, or any taskmesh-side threshold/hysteresis config.
+If a second consumer later wants the same backpressure controller logic,
+that argues for extracting a *shared consumer-side library*, not moving it
+into taskmesh — taskmesh's job stops at "resize the pool safely."
+
+## D31 — `taskmesh-impl` split into three fully-independent tiers (`-simple`/`-pro`/`-max`); `BacklogPromoter` decouples `tm_task` enqueue from `tm_in_flight` hot-row creation
+
+A ~100 crore (1 billion) row one-shot migration surfaced a real limit in the
+D28 hot/cold split: `tm_task` and `tm_in_flight` are created **eagerly as a
+pair** at `enqueue()`. If a migration enqueues its full backlog up front,
+`tm_in_flight` — the hot table `findClaimableMultiNode` scans continuously —
+balloons to the same size as the entire backlog, not the "current
+backlog+active" window it's designed for.
+
+**`BacklogPromoter` (new `-api` interface)**: `onEnqueue(TaskRef, nodeId)` —
+called synchronously right after a task's `tm_task` row is written — and
+`promote(taskType, now, limit)` — called periodically by the engine on its
+own `ScheduledExecutorService` (`TaskMeshEngineImpl.backlogScheduler`, same
+`scheduleWithFixedDelay` idiom as the existing claim poller). Two
+implementations: `NoopBacklogPromoter` (default everywhere — `onEnqueue`
+creates the hot row immediately, `promote` is a true no-op, reproducing
+D28's original eager-pair behavior exactly) and `JpaBacklogPromoter`
+(taskmesh-max only — `onEnqueue` no-ops, `promote` creates hot rows for the
+oldest still-`promoted_at IS NULL` backlog rows in bounded batches, stamping
+`tm_task.promoted_at` so a repeat cycle doesn't re-promote). This is a
+**deliberate, documented amendment to D28** for consumers using
+`JpaBacklogPromoter`: the pair is no longer created atomically at enqueue.
+
+**Module split**: rather than bolt scale-specific machinery onto one
+`taskmesh-impl`, persistence became three tiered, **fully independent**
+artifacts — each with its own JPA entities/repositories/DDL, chosen
+deliberately over a shared-core module so a schema change in the largest
+tier (partitioning, widened PKs) can never leak into the smallest tier's
+code or DDL:
+
+- **`taskmesh-simple`** (renamed from `taskmesh-impl`) — small-scale,
+  single-node by default, `MultiNodeTaskLedger` available. Always
+  `NoopBacklogPromoter`; `enqueue()` unchanged from D28 (still creates both
+  rows inline).
+- **`taskmesh-pro`** — medium/large-scale, `MultiNodeTaskLedger` by default,
+  switchable to single-node. Structurally near-identical to `-simple` today
+  (accepted duplication cost of the independence guarantee) — differs mainly
+  in default wiring; still always `NoopBacklogPromoter`.
+- **`taskmesh-max`** — the one tier whose `enqueue()` only ever writes
+  `tm_task`, deferring hot-row creation entirely to whichever
+  `BacklogPromoter` is wired (`NoopBacklogPromoter` still the default;
+  `JpaBacklogPromoter` opt-in). Also the intended home for the `partitionKey`/
+  `PartitionedTaskLedger` work discussed alongside this — **not yet
+  implemented**, tracked separately.
+
+**`taskmesh-spring-boot-starter` dependency direction inverted.** It used to
+own `TaskmeshEngineAutoConfiguration`/`ProfileFactories`/`TaskmeshJpaAutoConfiguration`
+and depend on `taskmesh-impl`. With three independent tiers, the starter
+can't depend on all three (defeats the independence point) or reference a
+single tier's classes (arbitrarily privileges one tier). Fix: the starter
+now holds only tier-agnostic pieces (`TaskmeshProperties`, `WorkloadProfile`,
+`Slf4jMetricsReporter`, `SingleProviderPayloadProviderFactory`) with **zero**
+dependency on any tier; each tier depends on the starter instead and ships
+its own `<tier>.starter.{ProfileFactories,TaskmeshJpaAutoConfiguration,
+TaskmeshEngineAutoConfiguration,TaskmeshProfileBuilder}` plus its own
+`AutoConfiguration.imports`. No `@ConditionalOnClass` tier-detection needed —
+a consumer depends on exactly one tier module, so only that tier's
+`AutoConfiguration.imports` is ever on the classpath. `Jitter` (previously
+nested in `ExponentialBackoffRetryPolicy`, itself duplicated per tier) moved
+to `taskmesh-api` as a standalone enum, since `TaskmeshProperties` needed one
+tier-agnostic reference to it.
+
+**Rules out**: a shared `taskmesh-impl-core` module for entities/repositories
+(considered, explicitly rejected in favor of full independence); folding
+`WorkloadProfile` or the metrics-backend Variant-A/B extension point into
+more tiers (both stay orthogonal axes, not additional tiers).
+
+## D32 — `taskmesh-max`: caller-supplied `partitionKey`, `PartitionedTaskLedger` replaces `MultiNodeTaskLedger`
+
+Resolved through an extended grill-me/devil's-advocate session (not a single
+top-down design). Key decisions:
+
+- The partition key is **caller-supplied**, never computed/hashed by
+  taskmesh. `TaskRef` gains a third component, `partitionKey` (nullable,
+  2-arg constructor overload defaults it to `null`) — kept on the **shared**
+  `taskmesh-api` record rather than a `taskmesh-max`-only subtype, because
+  the engine's "never branches on tier" invariant means `TaskMeshEngineImpl`
+  can't `instanceof`-check a tier-specific `TaskRef` when constructing
+  `TaskContext`/`HistoryEvent`. `taskmesh-simple`/`-pro` are entirely
+  unaffected — the 2-arg constructor keeps every existing call site
+  compiling.
+- `taskmesh-max` ships **only** `PartitionedTaskLedger` (renamed from
+  `MultiNodeTaskLedger`, not a class added alongside it) — `SimpleTaskLedger`
+  is **dropped entirely** from this tier. Partitioning is a multi-node/scale
+  concept; a single-node deployment has no claim race to partition around,
+  and this tier's whole reason to exist is large-scale (~100 crore row)
+  migrations, not a single-node workload.
+- `enqueue()`/`rerun()` **hard-fail** (`IllegalArgumentException`) on a
+  missing `partitionKey` — consistent with the repo's "silence is a bug"
+  invariant. No default/fallback bucket, and `rerun()` specifically has no
+  fallback cross-partition lookup either — the operator-facing caller always
+  supplies it, or the call throws.
+- `partition_key` is added to `tm_task`, `tm_in_flight`, `tm_history_event`,
+  `tm_incident`, `tm_attempt_history`. It's part of the **primary key** on
+  four of those five (Postgres requires the partition column in every unique
+  constraint on a table that's physically partitioned) — the exception is
+  `tm_in_flight`, a plain column only, since that table is never physically
+  partitioned (the `JpaBacklogPromoter`-throttled feeder keeps it bounded
+  regardless, D31). `tm_audit_event` is **explicitly out of scope** —
+  deferred, mainly because of its nullable-`task_id` cluster-wide-event case
+  (`PAUSE_REQUESTED`/`RESUME_REQUESTED` have no task, so no natural partition
+  key either).
+- **Caller contract, not enforced by the ledger**: `(taskType, taskId)` must
+  map to exactly one, stable `partitionKey`. `tm_task`'s widened PK
+  technically admits two different `partitionKey` values for the same
+  `(taskType, taskId)`, but `tm_in_flight`'s PK does not include
+  `partitionKey` — a caller that violates this contract gets an unsupported,
+  inconsistent hot-row state (the second enqueue's hot-row creation silently
+  no-ops), not a clean error. Documented on `PartitionedTaskLedger`'s class
+  Javadoc; not covered by a test — an out-of-contract scenario, not a
+  supported one.
+- taskmesh ships **zero partitioning opinion** — no default `HASH`/`LIST`
+  scheme, no modulus, no `PARTITION BY` clause in the reference DDL at all.
+  Only the column + widened key. The actual partitioning scheme is entirely
+  the consuming application's own DDL, same as every other Postgres-specific
+  tuning note already in `docs/schema.md` (fillfactor, autovacuum).
+- **Real Hibernate limitation hit during implementation**: `IDENTITY`
+  generation isn't supported inside an `@IdClass` composite key
+  ("Identity generation isn't supported for composite ids"). `tm_history_event`/
+  `tm_incident` (both previously a simple surrogate `@Id @GeneratedValue(IDENTITY)`)
+  switch to an explicit `@SequenceGenerator`/`SEQUENCE` at this tier — which
+  also happens to be the right mechanism for keeping `id` globally unique
+  across physical partitions anyway (an `IDENTITY`/`SERIAL` column isn't
+  reliably shared across Postgres partitions; an explicit sequence is).
+- `HistoryEvent`/`Incident` already embed `TaskRef`, so `HistoryWriter`/
+  `IncidentStore` `-api` interfaces needed **no signature change** —
+  `partitionKey` reaches the `Jpa*` implementations for free through the
+  `TaskRef` they're already handed.
+
+**Rules out**: hashing/deriving the partition key internally (rejected in
+Q1 of the grill-me session — the calling application always supplies it);
+a taskmesh-shipped default `PARTITION BY` scheme (rejected — zero opinion,
+consumer-owned); keeping `SimpleTaskLedger` in `taskmesh-max` as a switchable
+option (rejected — not this tier's use case); a fallback cross-partition
+lookup in `rerun()` (rejected — hard-fail instead, matching `enqueue()`).

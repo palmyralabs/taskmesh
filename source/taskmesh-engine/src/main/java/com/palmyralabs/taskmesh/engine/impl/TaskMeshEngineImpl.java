@@ -3,6 +3,7 @@ package com.palmyralabs.taskmesh.engine.impl;
 import com.palmyralabs.taskmesh.api.ActorType;
 import com.palmyralabs.taskmesh.api.AuditEvent;
 import com.palmyralabs.taskmesh.api.AuditEventSink;
+import com.palmyralabs.taskmesh.api.BacklogPromoter;
 import com.palmyralabs.taskmesh.api.ClaimOutcome;
 import com.palmyralabs.taskmesh.api.ClaimStrategy;
 import com.palmyralabs.taskmesh.api.Classification;
@@ -67,6 +68,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     private final ClaimStrategy claimStrategy;
     private final HeartbeatStrategy heartbeatStrategy;
     private final TaskLedger taskLedger;
+    private final BacklogPromoter backlogPromoter;
     private final FailureClassifier failureClassifier;
     private final PauseController pauseController;
     private final HistoryWriter historyWriter;
@@ -85,16 +87,26 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         thread.setDaemon(true);
         return thread;
     });
+    private final ScheduledExecutorService backlogScheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "taskmesh-backlog-promoter");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     // Best-effort, engine-local, non-authoritative attempt counter — see
     // Q-ATTEMPTNUM in docs/planning/open-questions.md.
     private final ConcurrentMap<TaskRef, AtomicInteger> localAttemptCounters = new ConcurrentHashMap<>();
 
+    // Guards workerPool's core/max resize pair (D30) so a shrink and a grow
+    // racing each other can't leave core > max mid-flight.
+    private final Object poolResizeLock = new Object();
+
     private volatile boolean shutdownRequested = false;
 
     public TaskMeshEngineImpl(NodeInfoProvider nodeInfoProvider, ProcessorRegistry processorRegistry,
                                List<String> taskTypes, ClaimStrategy claimStrategy, HeartbeatStrategy heartbeatStrategy,
-                               TaskLedger taskLedger, FailureClassifier failureClassifier, PauseController pauseController,
+                               TaskLedger taskLedger, BacklogPromoter backlogPromoter, FailureClassifier failureClassifier,
+                               PauseController pauseController,
                                HistoryWriter historyWriter, AuditEventSink auditEventSink, IncidentStore incidentStore,
                                MetricsReporter metricsReporter, TimeoutPolicy timeoutPolicy,
                                PayloadProviderFactory payloadProviderFactory, SchedulingConfig schedulingConfig) {
@@ -104,6 +116,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         this.claimStrategy = claimStrategy;
         this.heartbeatStrategy = heartbeatStrategy;
         this.taskLedger = taskLedger;
+        this.backlogPromoter = backlogPromoter;
         this.failureClassifier = failureClassifier;
         this.pauseController = pauseController;
         this.historyWriter = historyWriter;
@@ -145,6 +158,8 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
                 nodeInfoProvider.nodeId(), pauseController.isPauseRequested());
         long intervalMillis = TimeUnit.SECONDS.toMillis(schedulingConfig.getQueryIntervalSeconds());
         pollerScheduler.scheduleWithFixedDelay(this::pollOnce, 0, intervalMillis, TimeUnit.MILLISECONDS);
+        long backlogIntervalMillis = TimeUnit.SECONDS.toMillis(schedulingConfig.getBacklogIntervalSeconds());
+        backlogScheduler.scheduleWithFixedDelay(this::promoteBacklogOnce, 0, backlogIntervalMillis, TimeUnit.MILLISECONDS);
     }
 
     @Override
@@ -152,12 +167,44 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         log.info("taskmesh engine stopping, nodeId={}", nodeInfoProvider.nodeId());
         shutdownRequested = true;
         pollerScheduler.shutdownNow();
+        backlogScheduler.shutdownNow();
         workerPool.shutdown();
         try {
             workerPool.awaitTermination(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * Runtime worker-pool resize (D30) — bounded to {@code [1, the pool size the
+     * engine was built with]}: callers can throttle down and recover, never scale
+     * past the originally configured ceiling. Backpressure policy (when/why to
+     * resize) is entirely the caller's concern; the engine just resizes.
+     */
+    @Override
+    public void adjustPoolSize(int size) {
+        int ceiling = schedulingConfig.getWorkerPoolSize();
+        int bounded = Math.max(1, Math.min(size, ceiling));
+        synchronized (poolResizeLock) {
+            int current = workerPool.getCorePoolSize();
+            if (bounded == current) {
+                return;
+            }
+            if (bounded > current) {
+                workerPool.setMaximumPoolSize(bounded);
+                workerPool.setCorePoolSize(bounded);
+            } else {
+                workerPool.setCorePoolSize(bounded);
+                workerPool.setMaximumPoolSize(bounded);
+            }
+            log.info("taskmesh engine worker pool resized {} -> {}, nodeId={}", current, bounded, nodeInfoProvider.nodeId());
+        }
+    }
+
+    @Override
+    public int currentPoolSize() {
+        return workerPool.getCorePoolSize();
     }
 
     /** Operator-triggered pause — the one case AuditEventSink is written to (never for routine transitions). */
@@ -208,6 +255,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     @Override
     public void enqueue(TaskRef taskRef) {
         taskLedger.enqueue(taskRef);
+        backlogPromoter.onEnqueue(taskRef, nodeInfoProvider.nodeId());
         if (executionQueue.isRegularHalfFull()) {
             return;
         }
@@ -231,6 +279,11 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     @Override
     public void execute(TaskRef taskRef) {
         taskLedger.enqueue(taskRef);
+        // Same hook as enqueue() — note a throttling BacklogPromoter that defers
+        // hot-row creation here also defers priority-path claimability, since
+        // claim() operates on tm_in_flight; that tradeoff belongs to the
+        // BacklogPromoter implementation, not this call site.
+        backlogPromoter.onEnqueue(taskRef, nodeInfoProvider.nodeId());
         if (!inFlightSet.add(taskRef)) {
             return;
         }
@@ -262,6 +315,13 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
             for (TaskRef taskRef : pending) {
                 submitFromPoller(taskRef);
             }
+        }
+    }
+
+    /** Periodic hot-row promotion — a no-op call for NoopBacklogPromoter, real work for a throttling implementation. */
+    private void promoteBacklogOnce() {
+        for (String taskType : taskTypes) {
+            backlogPromoter.promote(taskType, Instant.now(), schedulingConfig.getBacklogBatchSize());
         }
     }
 

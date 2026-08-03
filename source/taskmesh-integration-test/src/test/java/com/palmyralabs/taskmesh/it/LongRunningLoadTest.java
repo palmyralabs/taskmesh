@@ -2,8 +2,8 @@ package com.palmyralabs.taskmesh.it;
 
 import com.palmyralabs.taskmesh.api.TaskRef;
 import com.palmyralabs.taskmesh.engine.TaskMeshEngine;
-import com.palmyralabs.taskmesh.impl.entity.TaskStatus;
-import com.palmyralabs.taskmesh.impl.repository.TmTaskRepository;
+import com.palmyralabs.taskmesh.simple.entity.TaskStatus;
+import com.palmyralabs.taskmesh.simple.repository.TmTaskRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;

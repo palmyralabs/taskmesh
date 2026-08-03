@@ -1,6 +1,7 @@
 package com.palmyralabs.taskmesh.engine;
 
 import com.palmyralabs.taskmesh.api.AuditEventSink;
+import com.palmyralabs.taskmesh.api.BacklogPromoter;
 import com.palmyralabs.taskmesh.api.ClaimStrategy;
 import com.palmyralabs.taskmesh.api.FailureClassifier;
 import com.palmyralabs.taskmesh.api.HeartbeatStrategy;
@@ -43,6 +44,19 @@ public interface TaskMeshEngine {
     void start();
 
     void stop();
+
+    /**
+     * Runtime worker-pool resize for backpressure-driven throttling (D30).
+     * Bounded to {@code [1, the pool size the engine was built with]} — this
+     * only lets a caller throttle down and recover, never scale past the
+     * originally configured ceiling. The engine has no opinion on when to call
+     * this; the caller owns whatever signal (latency, queue depth, ...) drives
+     * the decision.
+     */
+    void adjustPoolSize(int size);
+
+    /** Current core pool size — reflects the effect of {@link #adjustPoolSize}. */
+    int currentPoolSize();
 
     /** Operator-triggered pause — the one case AuditEventSink is written to (never for routine transitions). */
     void pause(String performedBy);
@@ -87,6 +101,7 @@ public interface TaskMeshEngine {
         private ClaimStrategy claimStrategy;
         private HeartbeatStrategy heartbeatStrategy;
         private TaskLedger taskLedger;
+        private BacklogPromoter backlogPromoter;
         private FailureClassifier failureClassifier = new DefaultFailureClassifier();
         private PauseController pauseController;
         private HistoryWriter historyWriter;
@@ -131,6 +146,11 @@ public interface TaskMeshEngine {
 
         public Builder taskLedger(TaskLedger taskLedger) {
             this.taskLedger = taskLedger;
+            return this;
+        }
+
+        public Builder backlogPromoter(BacklogPromoter backlogPromoter) {
+            this.backlogPromoter = backlogPromoter;
             return this;
         }
 
@@ -183,6 +203,7 @@ public interface TaskMeshEngine {
             Objects.requireNonNull(claimStrategy, "claimStrategy is required");
             Objects.requireNonNull(heartbeatStrategy, "heartbeatStrategy is required");
             Objects.requireNonNull(taskLedger, "taskLedger is required");
+            Objects.requireNonNull(backlogPromoter, "backlogPromoter is required");
             Objects.requireNonNull(pauseController, "pauseController is required");
             Objects.requireNonNull(historyWriter, "historyWriter is required");
             Objects.requireNonNull(auditEventSink, "auditEventSink is required");
@@ -199,7 +220,7 @@ public interface TaskMeshEngine {
                 taskTypes = processors.stream().map(TaskProcessor::taskType).toList();
             }
             return new TaskMeshEngineImpl(nodeInfoProvider, processorRegistry, taskTypes, claimStrategy, heartbeatStrategy,
-                    taskLedger, failureClassifier, pauseController, historyWriter, auditEventSink, incidentStore,
+                    taskLedger, backlogPromoter, failureClassifier, pauseController, historyWriter, auditEventSink, incidentStore,
                     metricsReporter, timeoutPolicy, payloadProviderFactory, schedulingConfig);
         }
     }
