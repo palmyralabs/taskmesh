@@ -11,3 +11,9 @@ dependencies {
     testImplementation 'org.springframework.boot:spring-boot-starter-test:3.3.4'
     testRuntimeOnly 'com.h2database:h2:2.2.224'
 }
+
+// The large-scale soak test runs ~600 worker threads and 50k tasks in in-memory H2.
+tasks.withType(Test).configureEach {
+    maxHeapSize = '2g'
+    jvmArgs '-Xss512k'
+}
