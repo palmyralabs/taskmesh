@@ -367,7 +367,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
             incidentStore.open(new Incident(taskRef, "NO_PROCESSOR",
                     "No TaskProcessor registered for task type '" + taskRef.taskType() + "'", Instant.now()));
             claimStrategy.release(taskRef, ReleaseRequest.failedTerminal("NO_PROCESSOR", "No TaskProcessor registered"));
-            historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.FAILED, "NO_PROCESSOR", Instant.now()));
+            historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.FAILED, "NO_PROCESSOR", Instant.now(), nodeInfoProvider.nodeId()));
             return;
         }
         TaskProcessor processor = processorRegistry.lookup(taskRef.taskType());
@@ -377,7 +377,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         Instant deadline = Instant.now().plus(timeout);
         DefaultTaskContext ctx = new DefaultTaskContext(taskRef, payloadProvider, heartbeatStrategy, pauseController,
                 () -> shutdownRequested);
-        historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.STARTED, null, Instant.now()));
+        historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.STARTED, null, Instant.now(), nodeInfoProvider.nodeId()));
 
         // Phase 4 — Execution
         Instant startedAt = Instant.now();
@@ -386,7 +386,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
             if (!ctx.isOwnershipValid()) {
                 // Phase 6 — lost ownership mid-execution: no release, audit-only history.
-                historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.OWNERSHIP_LOST, null, Instant.now()));
+                historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.OWNERSHIP_LOST, null, Instant.now(), nodeInfoProvider.nodeId()));
                 return;
             }
             if (Instant.now().isAfter(deadline)) {
@@ -397,12 +397,12 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
             // Phase 5a — Success
             claimStrategy.release(taskRef, ReleaseRequest.completed());
-            historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.COMPLETED, null, Instant.now()));
+            historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.COMPLETED, null, Instant.now(), nodeInfoProvider.nodeId()));
             metricsReporter.taskCompleted(taskRef.taskType(), Duration.between(startedAt, Instant.now()));
         } catch (Exception failure) {
             if (!ctx.isOwnershipValid()) {
                 historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.OWNERSHIP_LOST,
-                        summarize(failure), Instant.now()));
+                        summarize(failure), Instant.now(), nodeInfoProvider.nodeId()));
                 return;
             }
             handleFailure(taskRef, attemptNumber, failure);
@@ -420,11 +420,11 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
         switch (outcome) {
             case LOST_OWNERSHIP -> historyWriter.record(new HistoryEvent(
-                    taskRef, attemptNumber, HistoryEventType.OWNERSHIP_LOST, summarize(failure), Instant.now()));
+                    taskRef, attemptNumber, HistoryEventType.OWNERSHIP_LOST, summarize(failure), Instant.now(), nodeInfoProvider.nodeId()));
             case OK -> {
                 if (classification.retryable()) {
                     historyWriter.record(new HistoryEvent(
-                            taskRef, attemptNumber, HistoryEventType.RETRIED, classification.reasonCode(), Instant.now()));
+                            taskRef, attemptNumber, HistoryEventType.RETRIED, classification.reasonCode(), Instant.now(), nodeInfoProvider.nodeId()));
                     metricsReporter.taskRetried(taskRef.taskType(), classification.reasonCode());
                 } else {
                     openTerminalIncident(taskRef, attemptNumber, classification, failure);
@@ -437,7 +437,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     private void openTerminalIncident(TaskRef taskRef, int attemptNumber, Classification classification, Exception failure) {
         String reasonCode = classification.reasonCode();
         incidentStore.open(new Incident(taskRef, reasonCode, summarize(failure), Instant.now()));
-        historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.FAILED, reasonCode, Instant.now()));
+        historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.FAILED, reasonCode, Instant.now(), nodeInfoProvider.nodeId()));
         metricsReporter.taskFailed(taskRef.taskType(), reasonCode);
     }
 

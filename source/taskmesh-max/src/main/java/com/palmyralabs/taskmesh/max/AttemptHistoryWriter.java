@@ -35,6 +35,7 @@ public class AttemptHistoryWriter implements HistoryWriter {
             entity.setPartitionKey(id.getPartitionKey());
             entity.setStatus(HistoryEventType.STARTED);
             entity.setStartedAt(event.occurredAt());
+            entity.setNodeId(event.nodeId());
             repository.save(entity);
             return;
         }
@@ -42,6 +43,7 @@ public class AttemptHistoryWriter implements HistoryWriter {
         repository.findById(id).ifPresentOrElse(entity -> {
             entity.setStatus(event.type());
             entity.setDetail(event.detail());
+            entity.setNodeId(event.nodeId());
             if (isTerminal(event.type())) {
                 entity.setEndedAt(event.occurredAt());
             }
@@ -56,6 +58,7 @@ public class AttemptHistoryWriter implements HistoryWriter {
             entity.setStatus(event.type());
             entity.setStartedAt(event.occurredAt());
             entity.setDetail(event.detail());
+            entity.setNodeId(event.nodeId());
             if (isTerminal(event.type())) {
                 entity.setEndedAt(event.occurredAt());
             }

@@ -7,5 +7,6 @@ public record HistoryEvent(
         int attemptNumber,
         HistoryEventType type,
         String detail,
-        Instant occurredAt) {
+        Instant occurredAt,
+        String nodeId) {
 }

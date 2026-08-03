@@ -108,6 +108,7 @@ CREATE TABLE tm_attempt_history (
     status         VARCHAR(32)  NOT NULL,           -- last HistoryEventType for the attempt
     started_at     TIMESTAMP(6) WITH TIME ZONE NOT NULL,
     ended_at       TIMESTAMP(6) WITH TIME ZONE,
+    node_id        VARCHAR(255),                     -- node that recorded the attempt's most recent event
     detail         TEXT,
     CONSTRAINT pk_tm_attempt_history PRIMARY KEY (task_type, task_id, attempt_number, partition_key)  -- -simple/-pro: omit partition_key
 );

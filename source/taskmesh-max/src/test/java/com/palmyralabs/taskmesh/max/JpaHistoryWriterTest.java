@@ -28,9 +28,9 @@ class JpaHistoryWriterTest {
         JpaHistoryWriter writer = new JpaHistoryWriter(repository, HistoryLevel.MINIMAL);
         TaskRef ref = new TaskRef("T", "minimal-1", "P1");
 
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.STARTED, null, Instant.now()));
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.HEARTBEAT, null, Instant.now()));
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.COMPLETED, null, Instant.now()));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.STARTED, null, Instant.now(), "node-1"));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.HEARTBEAT, null, Instant.now(), "node-1"));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.COMPLETED, null, Instant.now(), "node-1"));
 
         assertEquals(1, countFor("minimal-1"), "MINIMAL should only keep the COMPLETED event");
     }
@@ -40,9 +40,9 @@ class JpaHistoryWriterTest {
         JpaHistoryWriter writer = new JpaHistoryWriter(repository, HistoryLevel.STANDARD);
         TaskRef ref = new TaskRef("T", "standard-1", "P1");
 
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.STARTED, null, Instant.now()));
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.HEARTBEAT, null, Instant.now()));
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.COMPLETED, null, Instant.now()));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.STARTED, null, Instant.now(), "node-1"));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.HEARTBEAT, null, Instant.now(), "node-1"));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.COMPLETED, null, Instant.now(), "node-1"));
 
         assertEquals(2, countFor("standard-1"), "STANDARD should keep STARTED + COMPLETED but skip HEARTBEAT");
     }
@@ -52,9 +52,9 @@ class JpaHistoryWriterTest {
         JpaHistoryWriter writer = new JpaHistoryWriter(repository, HistoryLevel.VERBOSE);
         TaskRef ref = new TaskRef("T", "verbose-1", "P1");
 
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.STARTED, null, Instant.now()));
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.HEARTBEAT, null, Instant.now()));
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.COMPLETED, null, Instant.now()));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.STARTED, null, Instant.now(), "node-1"));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.HEARTBEAT, null, Instant.now(), "node-1"));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.COMPLETED, null, Instant.now(), "node-1"));
 
         assertEquals(3, countFor("verbose-1"));
     }
@@ -64,7 +64,7 @@ class JpaHistoryWriterTest {
         JpaHistoryWriter writer = new JpaHistoryWriter(repository);
         TaskRef ref = new TaskRef("T", "default-1", "P1");
 
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.HEARTBEAT, null, Instant.now()));
+        writer.record(new HistoryEvent(ref, 1, HistoryEventType.HEARTBEAT, null, Instant.now(), "node-1"));
 
         assertEquals(1, countFor("default-1"), "no-arg constructor must preserve prior VERBOSE-equivalent behavior");
     }

@@ -272,6 +272,7 @@ than append-only.
 | `task_type`, `task_id`, `attempt_number` (PK) | One row per attempt — the composite key is load-bearing: `AttemptHistoryWriter` looks up by it to decide insert vs. update. |
 | `status` | Last `HistoryEventType` recorded for the attempt. |
 | `started_at`, `ended_at` | `ended_at` set only on a terminal outcome. |
+| `node_id` | The node that recorded the attempt's most recent event — set from `HistoryEvent.nodeId()` on every write (insert and update), so it reflects the current owner, not just who started it. |
 | `detail` | Free-text detail. |
 
 **`taskmesh-max` only** (D32): `partition_key` joins the PK (now four

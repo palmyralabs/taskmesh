@@ -56,6 +56,9 @@ public class TmAttemptHistoryEntity {
     @Column(name = "ended_at")
     private Instant endedAt;
 
+    @Column(name = "node_id", length = 255)
+    private String nodeId;
+
     @JdbcTypeCode(SqlTypes.LONGVARCHAR)
     @Column(name = "detail")
     private String detail;
