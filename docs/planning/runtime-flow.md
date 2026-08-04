@@ -68,7 +68,14 @@ an oversight.
 
 ## Phase 4 — Execution
 
-`TaskProcessor.process(ctx)` runs. At each checkpoint the processor calls
+`TaskProcessor.onStart(ctx)` fires first, in its own short transaction, before
+any work is done (D34). It is the only signal that says "this task is alive
+again" after an operator rerun — the D33 pair identifies which kind of start it
+is (`retryCount == 0` with `attemptCount > 1` is a rerun). A throw here aborts
+the execution before `process()` runs and travels Phase 5b like any other
+classified failure.
+
+Then `TaskProcessor.process(ctx)` runs. At each checkpoint the processor calls
 (granularity is the processor's own choice — per-document, per-chunk,
 whatever fits):
 
@@ -94,22 +101,32 @@ timeout), not a *preemption* mechanism. Added to `Q-TIMEOUT` in
 ## Phase 5a — Success
 
 1. `process()` returns normally.
-2. `ClaimStrategy.release(COMPLETED)`.
+2. `ClaimStrategy.release(COMPLETED)` — the engine opens the transaction (D34;
+   `ClaimStrategy` opens none of its own) and, still inside it, calls
+   `TaskProcessor.onTerminal(COMPLETED)`. A throw there rolls the release back
+   and the task comes round again.
 3. `HistoryWriter` records a `COMPLETED` event.
 4. `MetricsReporter` increments completion counter, records duration.
 5. `AuditEventSink` — **not** invoked; routine completion isn't a "meaningful
    operator action" (the filter both peer projects use).
 
+`onTerminal` fires the same way from the other three terminal paths: a
+`FAILED_TERMINAL` release (Phase 5c), a `RETRY` release whose budget ran out,
+and D33's claim-time exhaustion in Phase 2. It never fires on a within-budget
+retry, a yield, an ordinary reclaim, or a release that lost ownership.
+
 ## Phase 5b — Retryable failure
 
 1. `process()` throws.
 2. `FailureClassifier.classify(exception)` → `RETRYABLE` (default) + `reasonCode`.
-3. `ClaimStrategy.release(REQUEUE, reasonCode)` — the exhaustion check (has
+3. `ClaimStrategy.release(RETRY, reasonCode)` — *(D33 renamed `REQUEUE` to
+   `RETRY`; `YIELD` was added for cooperative hand-back, which consumes no
+   budget)* — the exhaustion check (has
    this task used up its retry budget?) happens **inside** this call, not in
    `FailureClassifier` or `RetryPolicy` independently (D16 — full reasoning
    and the concrete mechanism live in `claim-strategy.md`). If the budget is
    exhausted, the disposition is escalated to `FAILED_TERMINAL` (Phase 5c)
-   instead of `REQUEUE`. Otherwise `RetryPolicy` supplies the next retry
+   instead of `RETRY`. Otherwise `RetryPolicy` supplies the next retry
    time as part of the same atomic operation.
 4. `HistoryWriter` records `ATTEMPT_FAILED` / `RETRIED`.
 5. `MetricsReporter` increments retry counter.

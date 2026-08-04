@@ -96,7 +96,7 @@ class DoubleExecutionReproTest {
     }
 
     private String describe(TmHistoryEventEntity e) {
-        return "att" + e.getAttemptNumber() + ":" + e.getEventType()
+        return "att" + e.getAttemptCount() + "/r" + e.getRetryCount() + ":" + e.getEventType()
                 + (e.getDetail() != null ? "(" + e.getDetail() + ")" : "");
     }
 

@@ -909,3 +909,342 @@ a taskmesh-shipped default `PARTITION BY` scheme (rejected — zero opinion,
 consumer-owned); keeping `SimpleTaskLedger` in `taskmesh-max` as a switchable
 option (rejected — not this tier's use case); a fallback cross-partition
 lookup in `rerun()` (rejected — hard-fail instead, matching `enqueue()`).
+
+## D33 — Split the conflated `attempt_count` into nested attempt + retry counters
+
+Amends D28 (cold/hot split) and D27 (window-based claim model); supersedes the
+single-counter half of D16's exhaustion rule (the *location* of the check —
+inside `TaskLedger`/`ClaimStrategy.release()`, atomic with the counter read —
+is unchanged).
+
+`attempt_count` was doing two unrelated jobs: counting automatic retries after
+a failure, and surviving across `rerun` (seeded `cold.attempt_count + 1`) so an
+operator re-run continued the same sequence. Because one field served both, a
+consumer could not answer "is this task unstable?" separately from "has an
+operator re-run this?" — and `rerun` could not reset the retry budget, so a
+task that exhausted its retries could never be usefully re-run: it re-exhausted
+immediately. The standing comment *"maxAttempts=N allows N+1 total attempts"*
+was a symptom of the same conflation — the field was a retry count wearing an
+attempt name.
+
+**Two nested counters**, read as a pair (`(attempt 2, retry 3)` is the third
+retry of the second attempt):
+
+- **`attempt_count`** — outer, 1-based. An *attempt* is one operator-initiated
+  run. A freshly enqueued task is attempt 1; `rerun` increments it.
+  **Unbounded** — there is no maximum for a manual action, which is why
+  `max_attempts` was removed rather than renamed.
+- **`retry_count`** — inner, 0-based: the ordinal of the execution running
+  *right now* within the current attempt. Bounded by `max_retries`. **Reset to
+  `-1` whenever `attempt_count` increments** — a row that has never been
+  claimed has no current execution, and the first claim's `+1` lands it on 0,
+  so the value never needs a special case for "the first one".
+
+**The budget is spent at `claim()`, not `release()`.** This is the load-bearing
+half of the decision. A node that loses its lease cannot record anything — its
+release is unfenced (`deleteOwned`/`markReleased` are guarded by `node_id`) and
+returns `LOST_OWNERSHIP`. If `release()` is the only thing that bills *and* the
+only thing that terminates, then a task that systematically cannot finish
+within one lease consumes no budget and is reclaimed forever, never reaching a
+terminal state and never appearing as a failure. Billing on reclaim alone is
+not enough either: it makes the burned budget visible without making anything
+act on it. So:
+
+- **Every claim bills.** `claim`'s UPDATE carries
+  `retry_count = retry_count + CASE WHEN status = 'YIELDED' THEN 0 ELSE 1 END`
+  — atomic with the claim, no extra round trip, no sweeper (which D27's
+  visibility-based recovery deliberately avoids). The rule is deliberately
+  independent of *which* of the four windows admitted the claim, so no
+  combination of them smuggles a free execution past the budget.
+- **The only free claim is one resuming a `YIELD`**, which is the same
+  execution being handed back rather than a new one starting. That is why
+  `YIELDED` is its own `TaskStatus` and not just `QUEUED`: the status is how
+  `claim` tells the two apart. A pause/resume loop therefore cannot bankrupt a
+  task.
+- **Exhaustion is enforced there too.** Immediately after winning, the ledger
+  compares the freshly billed ordinal against
+  `min(max_retries, RetryPolicy.maxRetries)`. Over budget means the execution
+  is not admitted: the cold row is snapshotted `FAILED` with
+  `reason_code = RETRY_BUDGET_EXHAUSTED`, the hot row is deleted (same terminal
+  rule as every other outcome, D28), and the new `ClaimOutcome.EXHAUSTED` tells
+  the engine to open an incident and record the failure. The snapshot stores
+  the last ordinal that *actually ran* — the increment that tipped the budget
+  over belongs to an execution that never happens.
+
+The exhaustion check runs **after** the claim UPDATE rather than as another
+condition inside it, for two reasons: the eligibility block stays
+byte-identical to `findClaimable`'s (the drift that block must never suffer —
+see D27), and the terminal write is fenced by ownership the claim has just
+acquired, so no other node can be running the task while it happens.
+
+*(Amended by D34.)* That write originally took its own transaction, so that the
+`tm_task` → `tm_in_flight` lock order `enqueue`/`release` then used was
+preserved. It now joins the caller's, because the consumer callback D34
+introduces has to commit with it or not at all — and since this path already
+holds the hot row from the claim UPDATE, it fixed the order for everything else
+instead. D34 flipped `enqueue`/`release` to match: **hot row, then cold,
+everywhere.**
+
+**`release()` never moves a counter.** It keeps an exhaustion check for the
+ordinary path — a node that survives and reports its failure — deciding one
+step early that no next execution exists, rather than letting the task be
+claimed once more only to be terminated then. Both paths use the same predicate
+on the same value, and neither can double-bill because only `claim` writes.
+
+**The total budget is unchanged.** `max_retries = N` admits ordinals `0..N`,
+i.e. N+1 executions per attempt — the same total the old
+`attempt_count > max_attempts` check gave. `RetryPolicy.nextRetryAt` keys off
+`retry_count`, so re-run history no longer inflates the backoff of a fresh
+attempt.
+
+**Release dispositions become `COMPLETED` / `FAILED_TERMINAL` / `RETRY` /
+`YIELD`.** `REQUEUE` → `RETRY`: it consumes budget and applies backoff, so it
+is a retry, and keeping the name `requeue` would collide with the
+operator-initiated action — the exact conflation this decision removes.
+`YIELD` is new: the node still holds the lease and voluntarily returns
+unfinished work to `QUEUED`, consuming no budget and setting no backoff gate
+(it must be immediately claimable once whatever caused the yield clears), for
+cooperative pause/shutdown. It reuses `ReleaseOutcome.OK` rather than gaining
+its own outcome — nothing downstream needs to branch on it. Operator re-run
+stays outside the release API, in `TaskLedger.rerun`, which is correct: by
+definition it acts on a task with no live claim.
+
+**Schema, all three tiers.** `tm_in_flight` and `tm_task` both keep
+`attempt_count`, **add `retry_count`** and **`max_retries`**, and **drop
+`max_attempts`**. The cold row carries *both* counters because without
+`retry_count` there, "how many retries did this burn before it failed" is
+unanswerable once the hot row is deleted — one of the signals this split exists
+to expose. `tm_attempt_history`'s PK becomes
+`(task_type, task_id, attempt_count, retry_count[, partition_key])` and
+`tm_history_event`'s `attempt_number` becomes the pair. **The PK change is not
+optional and ships with the reset**: `rerun`'s old contract never reset the
+counter precisely *because* history was keyed by `attempt_number`, so
+restarting it would have made the next attempt's history write collide with and
+silently overwrite a pre-`rerun` row. With both counters in the key, `(1, 3)`
+and `(2, 0)` are distinct by construction; the reset alone would cause silent
+history loss.
+
+**API surface**: `TaskLedger.attemptCount(TaskRef)` becomes
+`counters(TaskRef)` returning the `AttemptCounters(attemptCount, retryCount)`
+record; `TaskContext.attemptNumber()` becomes `attemptCount()` +
+`retryCount()`; `HistoryEvent.attemptNumber` becomes the pair;
+`RetryPolicy.maxAttempts()` becomes `maxRetries()`; the
+`taskmesh.max-attempts` property becomes `taskmesh.max-retries`.
+
+**Rules out**: renaming `attempt_count` to `retry_count` and stopping there
+(rejected — loses the operator-attempt dimension entirely); keeping one counter
+and adding a separate `rerun_count` (rejected — the retry budget still could
+not be reset per attempt, which is the behaviour this exists for); a sweeper or
+a compensating write by the node that lost its lease to bill lease loss
+(rejected — the losing node's write is unfenced by construction, and a sweeper
+is exactly what D27 avoids); a `ReleaseOutcome.YIELDED` (rejected for now — no
+caller needs to distinguish it, unlike `ClaimOutcome.EXHAUSTED`, which the
+engine must branch on to open the incident); billing only on
+reclaim-of-an-expired-lease (rejected — it makes the burned budget visible but
+still leaves exhaustion enforceable only in `release()`, which the dying node
+never reaches, so the task is still never terminated); enforcing the budget by
+filtering over-budget rows out of discovery/claim eligibility (rejected — the
+row would then rot in `tm_in_flight` as invisible backlog with no incident and
+no terminal state, trading "retries forever" for "disappears silently", and it
+would put a third condition in the block claim and discovery must keep
+byte-identical).
+
+**Left open** (deliberately out of scope, see the retry/backoff-policy
+discussion): whether the per-row `max_retries` column or `RetryPolicy` owns the
+bound — for now both survive and the release reconciles them with
+`Math.min(...)`, exactly as before; per-`task_type` `RetryPolicy` (today a
+single instance is injected into the ledger, so bound and curve are
+engine-wide); and migration of existing rows versus a clean rebuild.
+
+## D34 — `onStart`/`onTerminal` on `TaskProcessor`; the engine owns the transaction boundary, not `ClaimStrategy`
+
+Builds on D33 (nested attempt/retry counters). Amends D33's claim-time
+termination, which no longer takes its own transaction.
+
+### The problem
+
+A consumer maintaining a **derived per-entity projection** for reporting needs
+to write it exactly once, at the terminal transition. Two facts rule out doing
+it inside `process()`:
+
+1. **A processor cannot know terminality.** It knows an execution failed, but
+   whether the retry budget is now spent is decided in `release()`/`claim()`,
+   after the processor has already thrown. A processor writing "failed" from
+   its own catch block would mark tasks terminal that are merely mid-retry.
+2. **Per-execution writes are not affordable.** On a projection table of
+   hundreds of millions of rows, an UPDATE per execution generates dead tuples
+   plus index churn — a status column is typically indexed, so the update
+   cannot be HOT. One insert and one terminal update per attempt keeps
+   autovacuum tractable, and that is only possible if the consumer is told when
+   terminality happens and at no other time.
+
+The hooks live on `TaskProcessor` rather than a standalone listener because
+they need the **payload** to identify the domain entity, and `TaskProcessor` is
+already the payload-typed seam. A separate listener would have to re-derive the
+entity from the task id — string-parsing an encoded key, exactly the fragility
+to avoid.
+
+### `onTerminal`
+
+Fires once per terminal transition, from all four terminal paths: a
+`COMPLETED` release, a `FAILED_TERMINAL` release, a `RETRY` release whose
+budget ran out, and D33's claim-time exhaustion. It does **not** fire on a
+within-budget `RETRY`, a `YIELD`, an ordinary reclaim, or a release that lost
+ownership — none of those are terminal, and a node that wrote nothing must not
+announce that the task finished.
+
+`TerminalOutcome` is three-valued — `COMPLETED` / `FAILED_NONRETRYABLE` /
+`FAILED_EXHAUSTED` — even though many consumers map both failures to one domain
+state. `FAILED_NONRETRYABLE` is a data problem that re-running will not fix;
+`FAILED_EXHAUSTED` is infrastructure trouble an operator rerun probably clears.
+Collapsing them leaves an undifferentiated failure queue to triage by hand.
+
+`TerminalContext` is deliberately **not** `TaskContext`: that type's lifecycle
+methods are meaningless or harmful at terminal time — `checkpoint()` would
+drive lease renewal on a task that is ending, inside the transaction ending it.
+Sharing one type would turn a compile-time distinction into a runtime one.
+Their common accessors are extracted into `TaskInfo`.
+
+### `onStart`, and why there is no `onRerun`
+
+`onTerminal` alone leaves a consumer projection stuck on its terminal state
+after an operator `rerun`: the task is alive again and nothing says so, so a
+`FAILED` row — usually a *worklist* that remediation jobs select on — invites
+duplicate remediation on work already back in flight.
+
+The answer is one hook, not two: `onStart` fires at the beginning of every
+execution, and the D33 counter pair already says which kind of start it is.
+
+| `(attemptCount, retryCount)` | meaning |
+|---|---|
+| `(1, 0)` | the task's first ever execution |
+| `(> 1, 0)` | **an operator re-ran it** — move the projection off its terminal state |
+| `(*, > 0)` | an automatic retry, or a reclaim after the previous node died |
+
+That also keeps the write volume affordable: within an attempt exactly one
+start has `retryCount == 0`, so a consumer writes on those and ignores retries
+— one row-touch per attempt, matching `onTerminal`'s one.
+
+A dedicated `onRerun` was rejected for a second reason too: `engine.rerun()`
+does not require the task type's processor to be registered on the node running
+it, so an admin instance can legitimately rerun a type it never executes and
+there would be no processor there to call. `onStart` fires on the node that
+actually picks the work up, which is always a node that has the processor.
+
+### The transaction boundary moved out of `ClaimStrategy`
+
+`onTerminal` must run **inside** the terminal transaction — a consumer's
+projection and the queue's terminal state must not be able to diverge, and
+there is no reconciliation job that could say how far apart they had drifted.
+The first implementation threaded a `TerminalHook` through
+`ClaimStrategy.claim`/`release` so the ledger could invoke it inside the
+transaction it opened. **Rejected**: it put consumer-callback plumbing into a
+public extension seam and into all five ledgers.
+
+Instead, `ClaimStrategy`'s three methods open **no transaction at all** and the
+caller supplies the boundary. `taskmesh-engine` depends only on
+`taskmesh-api`, so it gets one through `TransactionRunner` — a single-method
+`-api` interface each tier implements over the same `TransactionTemplate` its
+ledgers use. Because that template's propagation is `REQUIRED`, the ledger's
+work joins the engine's boundary rather than committing separately; the
+physical transaction count is unchanged, the outer one simply becomes the one
+that commits. Unwired it falls back to `TransactionRunner.DIRECT`, which is
+correct for the in-memory testkit and degrades the guarantee to best-effort
+rather than breaking.
+
+Consequences worth knowing:
+
+- **`ClaimStrategy` now requires an ambient transaction.** Calling it directly
+  without one fails loudly (`TransactionRequiredException`) rather than
+  silently doing half the work.
+- **`TaskLedger.enqueue` keeps its own boundary.** It swallows a
+  `DataIntegrityViolationException` to absorb the idempotent duplicate-enqueue
+  race, and that only works while the failed insert is isolated — inside a
+  caller's transaction the exception marks the whole thing rollback-only and
+  the swallow silently poisons it. `rerun` and `recoverOwnClaims` keep theirs
+  for the same self-contained reason.
+- **`checkpoint()` opens its own short transaction.** Lease renewal reaches
+  `ClaimStrategy.renew` from the middle of the processor's work, where no
+  engine transaction is (or should be) open.
+- **One lock order, everywhere: hot row, then cold.** See below — this replaces
+  an earlier draft of this decision that accepted an inverted order on the claim
+  path as a narrow risk. It is not narrow.
+
+### The single hot-then-cold lock order
+
+D33's claim-time termination holds the hot row from the claim UPDATE before it
+can possibly know the task is terminal, so it can only ever take `tm_task`
+second. Once that path exists, it fixes the order for every other path: any path
+taking `tm_task` first forms an ABBA cycle with it.
+
+The first draft of this decision accepted that, reasoning that a deadlock needs
+"a stale owner releasing the very same task at the instant a claim terminates
+it" and calling the window narrow. **A Postgres torture run deadlocked on it 40
+times out of 40.** The shape is not exotic: it is the ordinary lease-expiry race
+— a node finishing work whose lease has just lapsed, while the node that
+reclaimed the task terminates it. H2 could never have shown this, because
+`@DataJpaTest` runs every statement on one uncommitted connection that is rolled
+back, so there is no second transaction to deadlock against.
+
+So the rule is now uniform, and `release` was the path that changed:
+
+| path | order |
+|---|---|
+| `claim` → `terminateExhausted` | claim UPDATE (hot) → `terminalUpdate` (cold) |
+| `terminalRelease` | `deleteOwned` (hot) → `terminalUpdate` (cold) |
+| `retryRelease` | `markReleased` (hot) → `terminalUpdate` (cold, exhaustion branch only) |
+| `rerun` | delete + insert hot → `forceRequeue` (cold) |
+| `enqueue` | insert hot → insert cold |
+
+`terminalRelease`/`retryRelease` previously opened with
+`taskRepository.lockByPk(...)` — a pessimistic `SELECT … FOR UPDATE` on the cold
+row, added to order against `enqueue`. Both are gone. Nothing is lost by it:
+`terminalUpdate` takes the same row lock anyway, and the ordering it was
+protecting against never existed — `enqueue` writes nothing for a task that
+already exists, and a task that does not exist has nothing to release.
+`enqueue`'s two inserts were flipped to hot-first as well; that pair could not
+deadlock either way, but an invariant with an exception is not one you can
+check.
+
+Asserted by `PostgresTortureTest.concurrentClaimTerminationAndStaleReleaseDoNotDeadlock`,
+which drives exactly that shape 40 times and fails on any SQLSTATE `40P01`. It
+runs only under `-Ppg`, since on H2 it would prove nothing.
+
+### Failure semantics
+
+- **A throwing `onTerminal` vetoes the terminal transition.** The release rolls
+  back, the task stays claimed and comes round again. For an idempotent task
+  that is wasted work rather than corruption — but it means *a broken callback
+  presents as tasks that never finish*, which is documented on the interface.
+  It also means the callback can fire more than once for the same transition,
+  so implementations must be idempotent.
+- **A throwing `onStart` aborts the execution before `process()` runs** and
+  travels the ordinary classified-failure path: retried, budget-consuming, and
+  eventually terminal rather than looping forever. Unlike `onTerminal` it is
+  not the last word — a start that never happened is self-correcting, because
+  the next execution fires it again.
+- **Payload may be `null` on `onTerminal`.** A terminal reached with no
+  execution behind it (a budget found spent at claim time) has none loaded, and
+  the engine will not fetch one just to report an outcome — that would put
+  consumer I/O inside the terminal transaction for no benefit. So
+  `TypedTaskProcessor`'s terminal bridge **passes null through** where its
+  `process`/`onStart` bridges reject it: throwing there would roll back the
+  terminal transition of a task that is otherwise fine, turning a missing
+  payload into a task that can never finish.
+
+**Rules out**: doing the notification in `TaskMeshEngineImpl` *after*
+`release()` returns (rejected — post-commit, so a throw or a crash between
+commit and callback diverges silently, and the veto in DoD 3 becomes
+impossible); a `TerminalHook` parameter on `ClaimStrategy` (rejected — see
+above); reusing `TaskContext` for the terminal callback (rejected — lifecycle
+methods that are unsafe at terminal time); a separate `onRerun` hook (rejected
+— the counters already carry the signal, and rerun can happen on a node with no
+processor registered); giving the engine a Spring dependency to own the
+boundary directly (rejected — `taskmesh-engine` depends on `taskmesh-api` and
+nothing else, deliberately).
+
+**Left open**: whether a consumer that needs per-attempt history should get it
+from `onStart`/`onTerminal` pairs or from `tm_attempt_history` directly; and
+whether `TransactionRunner` should become mandatory rather than defaulting to
+`DIRECT`, which would catch a JPA tier wired without one at build time instead
+of at first write.

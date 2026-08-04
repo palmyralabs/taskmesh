@@ -18,8 +18,8 @@ import java.util.Optional;
 /**
  * Cold ledger repository — written only at enqueue and on the terminal
  * transition; never read by query/claim/release (all of which refer to the
- * hot {@link TmInFlightRepository} exclusively). The terminal write snapshots
- * the final {@code attempt_count}/{@code max_attempts} copied from the hot row
+ * hot {@link TmInFlightRepository} exclusively). The terminal write snapshots the final
+ * {@code attempt_count}/{@code retry_count}/{@code max_retries} copied from the hot row
  * (the live counters live there now) before that row is deleted.
  *
  * <p>{@code partition_key} is part of this table's PK (D32) — every identity
@@ -29,15 +29,15 @@ import java.util.Optional;
  */
 public interface TmTaskRepository extends JpaRepository<TmTaskEntity, PartitionedTaskId> {
 
-    /** Terminal snapshot — {@code attemptCount}/{@code maxAttempts} are copied from the hot row by the caller. */
+    /** Terminal snapshot — {@code attemptCount}/{@code retryCount}/{@code maxRetries} are copied from the hot row by the caller. */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmTaskEntity t SET t.status = :status, "
-            + "t.attemptCount = :attemptCount, t.maxAttempts = :maxAttempts, "
+            + "t.attemptCount = :attemptCount, t.retryCount = :retryCount, t.maxRetries = :maxRetries, "
             + "t.reasonCode = :reasonCode, t.errorSummary = :errorSummary, t.updatedAt = :now "
             + "WHERE t.taskType = :taskType AND t.taskId = :taskId AND t.partitionKey = :partitionKey")
     int terminalUpdate(@Param("taskType") String taskType, @Param("taskId") String taskId,
                         @Param("partitionKey") String partitionKey, @Param("status") TaskStatus status,
-                        @Param("attemptCount") int attemptCount, @Param("maxAttempts") int maxAttempts,
+                        @Param("attemptCount") int attemptCount, @Param("retryCount") int retryCount, @Param("maxRetries") int maxRetries,
                         @Param("reasonCode") String reasonCode, @Param("errorSummary") String errorSummary,
                         @Param("now") Instant now);
 
@@ -58,9 +58,19 @@ public interface TmTaskRepository extends JpaRepository<TmTaskEntity, Partitione
     @Query("SELECT t.status, COUNT(t) FROM TmTaskEntity t WHERE t.taskType = :taskType GROUP BY t.status")
     List<Object[]> countByTaskType(@Param("taskType") String taskType);
 
-    /** Operator-triggered rerun — unconditionally requeues regardless of current status. Pair with {@code TmInFlightRepository.resetForRerun}. */
+    /**
+     * Operator-triggered rerun — unconditionally requeues regardless of current status. Pair with
+     * {@code TmInFlightRepository.resetForRerun}.
+     *
+     * <p>Also stamps {@code promoted_at}, because {@code rerun} creates the hot row itself rather
+     * than leaving it to the {@code BacklogPromoter}. Without this, rerunning a task that was
+     * enqueued but never promoted leaves {@code status = QUEUED} and {@code promoted_at IS NULL}
+     * <i>with a live hot row</i> — which is exactly what {@code findUnpromoted} looks for, so the
+     * next promotion cycle would upsert over it and reset a claimed task to unclaimed.
+     */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmTaskEntity t SET t.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.QUEUED, "
+            + "t.promotedAt = :now, "
             + "t.updatedAt = :now WHERE t.taskType = :taskType AND t.taskId = :taskId AND t.partitionKey = :partitionKey")
     int forceRequeue(@Param("taskType") String taskType, @Param("taskId") String taskId,
                       @Param("partitionKey") String partitionKey, @Param("now") Instant now);

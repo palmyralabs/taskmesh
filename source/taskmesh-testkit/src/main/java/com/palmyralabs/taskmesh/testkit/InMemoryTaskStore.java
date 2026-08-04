@@ -1,5 +1,6 @@
 package com.palmyralabs.taskmesh.testkit;
 
+import com.palmyralabs.taskmesh.api.AttemptCounters;
 import com.palmyralabs.taskmesh.api.ClaimOutcome;
 import com.palmyralabs.taskmesh.api.ReleaseOutcome;
 import com.palmyralabs.taskmesh.api.ReleaseRequest;
@@ -28,33 +29,38 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class InMemoryTaskStore {
 
-    private enum Status { QUEUED, CLAIMED, COMPLETED, FAILED }
+    private enum Status { QUEUED, CLAIMED, YIELDED, COMPLETED, FAILED }
 
     private static class Row {
         TaskRef taskRef;
         Status status;
         String nodeId;
         int attemptCount;
-        int maxAttempts;
+        int retryCount;
+        int maxRetries;
         Instant nextRetryAt;
     }
 
+    /** A row that has never been claimed has no current execution; the first claim's +1 lands it on 0 (D33). */
+    static final int NO_EXECUTION_YET = -1;
+
     private final Map<TaskRef, Row> rows = new ConcurrentHashMap<>();
-    private final int defaultMaxAttempts;
+    private final int defaultMaxRetries;
 
     public InMemoryTaskStore() {
         this(3);
     }
 
-    public InMemoryTaskStore(int defaultMaxAttempts) {
-        this.defaultMaxAttempts = defaultMaxAttempts;
+    public InMemoryTaskStore(int defaultMaxRetries) {
+        this.defaultMaxRetries = defaultMaxRetries;
     }
 
     /**
-     * {@code attemptCount} always holds the current/most-recently-run
-     * attempt's own number (never a "prior count" needing a {@code +1} from
-     * the caller) — 1 for a freshly enqueued task, matching the production
-     * ledgers' hot-row semantics.
+     * {@code attemptCount} always holds the current attempt's own number
+     * (never a "prior count" needing a {@code +1} from the caller) — 1 for a
+     * freshly enqueued task — and {@code retryCount} the current execution's
+     * 0-based ordinal within it, matching the production ledgers' hot-row
+     * semantics (D33).
      */
     public void enqueue(TaskRef taskRef) {
         rows.compute(taskRef, (ref, existing) -> {
@@ -65,7 +71,8 @@ public class InMemoryTaskStore {
             row.nextRetryAt = null;
             if (existing == null) {
                 row.attemptCount = 1;
-                row.maxAttempts = defaultMaxAttempts;
+                row.retryCount = NO_EXECUTION_YET;
+                row.maxRetries = defaultMaxRetries;
             }
             return row;
         });
@@ -77,9 +84,11 @@ public class InMemoryTaskStore {
      * reached a terminal outcome (still {@code QUEUED}/{@code CLAIMED}) —
      * matching the production ledgers, rerun only resurrects a task whose
      * "hot row" (here: terminal status) shows it's actually done; a still-live
-     * task doesn't need it. Bumps {@code attemptCount} by 1 rather than
-     * clearing it — the next {@code attemptNumber} must continue past the
-     * pre-rerun attempts, not collide with one already recorded.
+     * task doesn't need it. Bumps {@code attemptCount} by 1 and resets
+     * {@code retryCount} to 0 (D33) — the re-run is a new outer attempt with
+     * a full fresh retry budget, and the widened
+     * {@code (attemptCount, retryCount)} history key keeps it from colliding
+     * with anything already recorded.
      */
     public void rerun(TaskRef taskRef) {
         rows.computeIfPresent(taskRef, (ref, row) -> {
@@ -93,6 +102,7 @@ public class InMemoryTaskStore {
             row.nodeId = null;
             row.nextRetryAt = null;
             row.attemptCount = row.attemptCount + 1;
+            row.retryCount = NO_EXECUTION_YET;
             return row;
         });
     }
@@ -106,7 +116,7 @@ public class InMemoryTaskStore {
             if (!row.taskRef.taskType().equals(taskType)) {
                 continue;
             }
-            if (row.status != Status.QUEUED) {
+            if (row.status != Status.QUEUED && row.status != Status.YIELDED) {
                 continue;
             }
             if (row.nextRetryAt != null && row.nextRetryAt.isAfter(now)) {
@@ -117,15 +127,31 @@ public class InMemoryTaskStore {
         return candidates;
     }
 
-    synchronized int attemptCount(TaskRef taskRef) {
+    synchronized AttemptCounters counters(TaskRef taskRef) {
         Row row = rows.get(taskRef);
-        return row != null ? row.attemptCount : 0;
+        return row != null ? new AttemptCounters(row.attemptCount, row.retryCount) : AttemptCounters.NONE;
     }
 
-    synchronized ClaimOutcome claim(TaskRef taskRef, String nodeId) {
+    /**
+     * Mirrors the JPA ledgers' D33 rule: every claim starts an execution and spends
+     * one unit of retry budget, except a claim that resumes a {@code YIELDED} row.
+     * An execution that would be over budget is not admitted — the task is
+     * terminated instead, which is the only way a task whose previous execution
+     * died without releasing ever reaches a terminal state.
+     */
+    synchronized ClaimOutcome claim(TaskRef taskRef, String nodeId, RetryPolicy retryPolicy) {
         Row row = rows.get(taskRef);
-        if (row == null || row.status != Status.QUEUED) {
+        if (row == null || (row.status != Status.QUEUED && row.status != Status.YIELDED)) {
             return ClaimOutcome.LOST;
+        }
+        if (row.status != Status.YIELDED) {
+            row.retryCount = row.retryCount + 1;
+        }
+        if (row.retryCount > Math.min(row.maxRetries, retryPolicy.maxRetries())) {
+            row.retryCount = row.retryCount - 1;   // the execution that tipped it over never runs
+            row.status = Status.FAILED;
+            row.nodeId = null;
+            return ClaimOutcome.EXHAUSTED;
         }
         row.status = Status.CLAIMED;
         row.nodeId = nodeId;
@@ -156,19 +182,26 @@ public class InMemoryTaskStore {
                 row.nodeId = null;
                 yield ReleaseOutcome.OK;
             }
-            case REQUEUE -> {
-                // Exhaustion is checked against the attempt that just ran (row.attemptCount — its own
-                // number), not a "next candidate" — preserves maxAttempts=N allowing N+1 total attempts.
-                if (row.attemptCount > Math.min(row.maxAttempts, retryPolicy.maxAttempts())) {
+            case RETRY -> {
+                // The counter is claim()'s to move (D33). Release only decides, one step early,
+                // whether a next execution exists at all: maxRetries=N allows N+1 per attempt.
+                int nextRetry = row.retryCount + 1;
+                if (nextRetry > Math.min(row.maxRetries, retryPolicy.maxRetries())) {
                     row.status = Status.FAILED;
                     row.nodeId = null;
                     yield ReleaseOutcome.EXHAUSTED;
                 }
-                int nextAttempt = row.attemptCount + 1;
-                row.attemptCount = nextAttempt;
                 row.status = Status.QUEUED;
                 row.nodeId = null;
-                row.nextRetryAt = retryPolicy.nextRetryAt(nextAttempt);
+                row.nextRetryAt = retryPolicy.nextRetryAt(nextRetry);
+                yield ReleaseOutcome.OK;
+            }
+            case YIELD -> {
+                // Cooperative hand-back: no budget consumed, no backoff gate, and its own status so
+                // the claim that picks it back up knows not to bill it.
+                row.status = Status.YIELDED;
+                row.nodeId = null;
+                row.nextRetryAt = null;
                 yield ReleaseOutcome.OK;
             }
         };

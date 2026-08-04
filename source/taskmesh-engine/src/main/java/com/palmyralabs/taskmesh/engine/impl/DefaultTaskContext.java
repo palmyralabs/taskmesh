@@ -1,5 +1,6 @@
 package com.palmyralabs.taskmesh.engine.impl;
 
+import com.palmyralabs.taskmesh.api.AttemptCounters;
 import com.palmyralabs.taskmesh.api.ErrorLogger;
 import com.palmyralabs.taskmesh.api.HeartbeatStrategy;
 import com.palmyralabs.taskmesh.api.PauseController;
@@ -8,6 +9,7 @@ import com.palmyralabs.taskmesh.api.ProgressReporter;
 import com.palmyralabs.taskmesh.api.RenewOutcome;
 import com.palmyralabs.taskmesh.api.TaskContext;
 import com.palmyralabs.taskmesh.api.TaskRef;
+import com.palmyralabs.taskmesh.api.TransactionRunner;
 
 import java.util.function.BooleanSupplier;
 
@@ -25,9 +27,10 @@ import java.util.function.BooleanSupplier;
 class DefaultTaskContext implements TaskContext {
 
     private final TaskRef taskRef;
-    private final int attemptNumber;
+    private final AttemptCounters counters;
     private final PayloadProvider payloadProvider;
     private final HeartbeatStrategy heartbeatStrategy;
+    private final TransactionRunner transactionRunner;
     private final PauseController pauseController;
     private final BooleanSupplier shutdownRequested;
     private final ProgressReporter progressReporter;
@@ -38,12 +41,14 @@ class DefaultTaskContext implements TaskContext {
 
     private volatile boolean ownershipValid = true;
 
-    DefaultTaskContext(TaskRef taskRef, int attemptNumber, PayloadProvider payloadProvider, HeartbeatStrategy heartbeatStrategy,
-                        PauseController pauseController, BooleanSupplier shutdownRequested) {
+    DefaultTaskContext(TaskRef taskRef, AttemptCounters counters, PayloadProvider payloadProvider, HeartbeatStrategy heartbeatStrategy,
+                        PauseController pauseController, BooleanSupplier shutdownRequested,
+                        TransactionRunner transactionRunner) {
         this.taskRef = taskRef;
-        this.attemptNumber = attemptNumber;
+        this.counters = counters;
         this.payloadProvider = payloadProvider;
         this.heartbeatStrategy = heartbeatStrategy;
+        this.transactionRunner = transactionRunner;
         this.pauseController = pauseController;
         this.shutdownRequested = shutdownRequested;
         this.progressReporter = new DefaultProgressReporter(this);
@@ -56,8 +61,13 @@ class DefaultTaskContext implements TaskContext {
     }
 
     @Override
-    public int attemptNumber() {
-        return attemptNumber;
+    public int attemptCount() {
+        return counters.attemptCount();
+    }
+
+    @Override
+    public int retryCount() {
+        return counters.retryCount();
     }
 
     @Override
@@ -73,12 +83,26 @@ class DefaultTaskContext implements TaskContext {
         return payload;
     }
 
+    /**
+     * The payload if this execution already loaded it, {@code null} otherwise —
+     * never triggering a load. Used to build the {@code TerminalContext}: the
+     * terminal transition runs inside the ledger's transaction, and fetching a
+     * payload there purely to report an outcome would put consumer I/O on that
+     * path for no benefit.
+     */
+    Object payloadIfLoaded() {
+        return payloadLoaded ? payload : null;
+    }
+
     @Override
     public void checkpoint() {
         if (!ownershipValid) {
             return;
         }
-        RenewOutcome outcome = heartbeatStrategy.onCheckpoint(taskRef);
+        // Its own short transaction: the renewal reaches ClaimStrategy#renew, which opens none of
+        // its own, and a checkpoint fires in the middle of the processor's work where no engine
+        // transaction is (or should be) open.
+        RenewOutcome outcome = transactionRunner.call(() -> heartbeatStrategy.onCheckpoint(taskRef));
         if (outcome == RenewOutcome.LOST) {
             ownershipValid = false;
         }

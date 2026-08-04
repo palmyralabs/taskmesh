@@ -33,7 +33,8 @@ public class JpaHistoryWriter implements HistoryWriter {
         TmHistoryEventEntity entity = new TmHistoryEventEntity();
         entity.setTaskType(event.taskRef().taskType());
         entity.setTaskId(event.taskRef().taskId());
-        entity.setAttemptNumber(event.attemptNumber());
+        entity.setAttemptCount(event.attemptCount());
+        entity.setRetryCount(event.retryCount());
         entity.setEventType(event.type());
         entity.setDetail(event.detail());
         entity.setOccurredAt(event.occurredAt());

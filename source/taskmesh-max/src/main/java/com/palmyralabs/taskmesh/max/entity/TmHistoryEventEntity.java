@@ -51,8 +51,11 @@ public class TmHistoryEventEntity {
     @Column(name = "task_id", nullable = false, length = 255)
     private String taskId;
 
-    @Column(name = "attempt_number", nullable = false)
-    private int attemptNumber;
+    @Column(name = "attempt_count", nullable = false)
+    private int attemptCount;
+
+    @Column(name = "retry_count", nullable = false)
+    private int retryCount;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "event_type", nullable = false, length = 32)

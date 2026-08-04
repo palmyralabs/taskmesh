@@ -58,7 +58,9 @@ consumer's TaskProcessor impls
   interfaces (`TaskProcessor`, `TaskContext`, `ClaimStrategy`, `TaskLedger`, `BacklogPromoter`,
   `HeartbeatStrategy`, `FailureClassifier`, `RetryPolicy`, `HistoryWriter`, `AuditEventSink`,
   `IncidentStore`, `PauseController`, `ProcessorRegistry`, `PayloadProvider`, `TimeoutPolicy`,
-  `MetricsReporter`) live here, plus tier-agnostic shared types like `Jitter`.
+  `MetricsReporter`, `TransactionRunner`) live here, plus tier-agnostic shared types like `Jitter`,
+  `AttemptCounters` (D33) and `TaskInfo`/`TerminalContext`/`TerminalOutcome` (D34 — `TaskContext`
+  and `TerminalContext` both extend `TaskInfo`, and stay separate types on purpose).
 - **`taskmesh-engine`** — the one "driving implementation": feeder/poller, claim loop,
   dispatcher, worker pool, and the `BacklogPromoter` promotion scheduler (its own
   `ScheduledExecutorService`, mirrors the claim poller). `TaskMeshEngine` (interface, built via
@@ -112,7 +114,40 @@ These are load-bearing; violating one is a correctness bug, not a style choice.
   provides no completion ledger.
 - **Failures are classified, not lumped** — `FailureClassifier` decides retryable (default) vs
   non-retryable. The **retry-exhaustion check lives inside `TaskLedger`/`ClaimStrategy.release()`**
-  (atomic with the attempt-counter read), not in `RetryPolicy` or `FailureClassifier` (D16).
+  (atomic with the retry-counter read), not in `RetryPolicy` or `FailureClassifier` (D16).
+- **Two nested counters, not one** (D33) — `attempt_count` is the *outer*, 1-based, unbounded count
+  of operator-initiated runs (only `rerun` moves it); `retry_count` is the *inner*, 0-based ordinal
+  of the execution running right now within that attempt, bounded by `max_retries` and **reset to
+  `-1` on every `rerun`**, so a re-run of an exhausted task gets a full fresh budget.
+- **Retry budget is spent at `claim()`, not `release()`** (D33) — every claim bills `retry_count +1`
+  **except** one resuming a `YIELDED` row, and the ledger terminates the task right there
+  (`ClaimOutcome.EXHAUSTED`, cold snapshot `FAILED`, hot row deleted) rather than admitting an
+  over-budget execution. This is the only thing that makes a lost lease cost anything: the node
+  that lost it is unfenced by construction and can never write, so a release-only model let a task
+  that never finishes inside one lease be reclaimed forever. `release()` keeps its own check for
+  the ordinary path but **never moves a counter**. Release dispositions are
+  `COMPLETED`/`FAILED_TERMINAL`/`RETRY`/`YIELD`.
+- **`ClaimStrategy` opens no transaction; the caller does** (D34) — `claim`/`renew`/`release` run
+  inside the caller's boundary, supplied by the engine via `TransactionRunner` (an `-api` interface,
+  so `taskmesh-engine` keeps its zero-Spring dependency; each tier adapts its own
+  `TransactionTemplate`, whose `REQUIRED` propagation makes the ledger's work *join* rather than
+  commit separately). That is what lets a terminal write and the consumer's `onTerminal` commit as
+  one unit. Calling a `ClaimStrategy` without an ambient transaction now fails loudly.
+  `TaskLedger.enqueue`/`rerun`/`recoverOwnClaims` keep their own boundaries — `enqueue`'s
+  duplicate-race swallow only works while its failed insert is isolated.
+- **`TaskProcessor` has two lifecycle hooks, both default no-ops** (D34) — `onTerminal` fires once
+  per terminal transition (all four paths), *inside* the terminal transaction, so a consumer's
+  derived projection cannot diverge from the queue; throwing vetoes the transition, which means a
+  broken callback presents as tasks that never finish. `onStart` fires before every execution and
+  is how a consumer spots an operator rerun: `retryCount == 0` with `attemptCount > 1` and nothing
+  else. There is deliberately no `onRerun` — the D33 counters already carry the signal.
+- **One lock order, everywhere: hot row, then cold** (D34) — every write path in every ledger
+  touches `tm_in_flight` before `tm_task`. Forced by D33's claim-time termination, which holds the
+  hot row from the claim UPDATE before it can know the task is terminal, so it can never take the
+  cold row first. `release` used to open with `lockByPk(tm_task)`; against real Postgres that
+  deadlocked with the claim path 40 times out of 40 (H2 cannot show this — `@DataJpaTest` rolls
+  everything back on one connection, so there is no second transaction to deadlock against).
+  Adding a path that writes `tm_task` first would reintroduce it.
 - **A missing processor or node crash does NOT burn a retry attempt** — it's a
   deployment/liveness issue, not a task failure; the claim is released for another node.
 - **Silence is a bug** — unregistered task types, lost claims, classification gaps must be loud
@@ -131,13 +166,15 @@ both created eagerly at enqueue, until a terminal outcome deletes the `tm_in_fli
 `tm_in_flight` and never join to `tm_task`.
 
 - **`tm_in_flight`** carries all claim-driving state: `status` (`QUEUED` reserved to `node_id` /
-  `NULL` unreserved / `CLAIMED` / `RELEASED`), `node_id`, the live retry counters
-  (`attempt_count`/`max_attempts`), the backoff gate (`next_retry_at`), and `lease_expires_at`.
+  `NULL` unreserved / `CLAIMED` / `RELEASED`), `node_id`, the live nested counters
+  (`attempt_count`/`retry_count`, bounded by `max_retries` — D33), the backoff gate
+  (`next_retry_at`), and `lease_expires_at`.
   Deleted at terminal outcome, so it tracks current backlog+active, not all-time history.
 - **`tm_task`** is written only at enqueue (`QUEUED`) and, as a **cold snapshot**, on the terminal
-  transition — where the final `attempt_count`/`max_attempts` are **copied from the hot row** before
-  it's deleted, alongside terminal `status`/`reason_code`. A retryable requeue does *not* touch it.
-  **No payload column** — payload is the consumer's `PayloadProvider` concern, never stored here.
+  transition — where the final `attempt_count`/`retry_count`/`max_retries` are **copied from the hot
+  row** before it's deleted, alongside terminal `status`/`reason_code`. A retry release does *not*
+  touch it. **No payload column** — payload is the consumer's `PayloadProvider` concern, never
+  stored here.
 
 `MultiNodeTaskLedger` uses a **4-window** eligibility model — reservation / reclaim / affinity /
 claim-timeout. A freshly enqueued `QUEUED` row is reserved to the enqueuing node; another node may

@@ -14,6 +14,7 @@ import com.palmyralabs.taskmesh.api.PayloadProviderFactory;
 import com.palmyralabs.taskmesh.api.ProcessorRegistry;
 import com.palmyralabs.taskmesh.api.TaskLedger;
 import com.palmyralabs.taskmesh.api.TaskProcessor;
+import com.palmyralabs.taskmesh.api.TransactionRunner;
 import com.palmyralabs.taskmesh.api.TaskRef;
 import com.palmyralabs.taskmesh.api.TimeoutPolicy;
 import com.palmyralabs.taskmesh.engine.impl.DefaultFailureClassifier;
@@ -111,6 +112,7 @@ public interface TaskMeshEngine {
         private TimeoutPolicy timeoutPolicy = new FixedTimeoutPolicy(Duration.ofMinutes(5));
         private PayloadProviderFactory payloadProviderFactory;
         private SchedulingConfig schedulingConfig = SchedulingConfig.builder().build();
+        private TransactionRunner transactionRunner = TransactionRunner.DIRECT;
 
         /** Optional — defaults to {@link DefaultNodeInfoProvider} (hostname+PID), so most applications never need to call this. */
         public Builder nodeInfoProvider(NodeInfoProvider nodeInfoProvider) {
@@ -199,6 +201,17 @@ public interface TaskMeshEngine {
             return this;
         }
 
+        /**
+         * Optional. Supply the tier's transaction manager so
+         * {@link TaskProcessor#onTerminal} runs inside the same transaction as the
+         * ledger's terminal write. Without it the callback still fires, but after
+         * the ledger has committed — see {@link TransactionRunner}.
+         */
+        public Builder transactionRunner(TransactionRunner transactionRunner) {
+            this.transactionRunner = transactionRunner;
+            return this;
+        }
+
         public TaskMeshEngine build() {
             Objects.requireNonNull(claimStrategy, "claimStrategy is required");
             Objects.requireNonNull(heartbeatStrategy, "heartbeatStrategy is required");
@@ -221,7 +234,7 @@ public interface TaskMeshEngine {
             }
             return new TaskMeshEngineImpl(nodeInfoProvider, processorRegistry, taskTypes, claimStrategy, heartbeatStrategy,
                     taskLedger, backlogPromoter, failureClassifier, pauseController, historyWriter, auditEventSink, incidentStore,
-                    metricsReporter, timeoutPolicy, payloadProviderFactory, schedulingConfig);
+                    metricsReporter, timeoutPolicy, payloadProviderFactory, schedulingConfig, transactionRunner);
         }
     }
 }

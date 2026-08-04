@@ -1,5 +1,6 @@
 package com.palmyralabs.taskmesh.max.starter;
 
+import com.palmyralabs.taskmesh.max.SpringTransactionRunner;
 import com.palmyralabs.taskmesh.api.AuditEventSink;
 import com.palmyralabs.taskmesh.api.BacklogPromoter;
 import com.palmyralabs.taskmesh.api.ClaimStrategy;
@@ -201,7 +202,7 @@ public final class TaskmeshProfileBuilder {
         NodeInfoProvider resolvedNodeInfoProvider = nodeInfoProvider != null ? nodeInfoProvider
                 : properties.getNodeId().isBlank() ? new DefaultNodeInfoProvider() : properties::getNodeId;
         RetryPolicy resolvedRetryPolicy = retryPolicy != null ? retryPolicy
-                : new ExponentialBackoffRetryPolicy(properties.getMaxAttempts(),
+                : new ExponentialBackoffRetryPolicy(properties.getMaxRetries(),
                         Duration.ofMinutes(properties.getBackoffBaseMinutes()), Duration.ofMinutes(properties.getBackoffCapMinutes()),
                         properties.getBackoffJitter());
         MetricsReporter resolvedMetricsReporter = metricsReporter != null ? metricsReporter : new Slf4jMetricsReporter();
@@ -224,6 +225,7 @@ public final class TaskmeshProfileBuilder {
                 : ProfileFactories.historyWriter(profile, historyEventRepository, attemptHistoryRepository);
 
         TaskMeshEngine engine = TaskMeshEngine.builder()
+                .transactionRunner(new SpringTransactionRunner(transactionTemplate))
                 .nodeInfoProvider(resolvedNodeInfoProvider)
                 .processors(processors)
                 .claimStrategy(resolvedClaimStrategy)

@@ -19,17 +19,22 @@ final class TmTaskEntities {
     }
 
     // Row-level cap left effectively unbounded — the wired RetryPolicy is the
-    // real gate (Math.min against it in requeueRelease), matching D16.
-    static final int UNBOUNDED_MAX_ATTEMPTS = Integer.MAX_VALUE;
+    // real gate (Math.min against it in retryRelease), matching D16.
+    static final int UNBOUNDED_MAX_RETRIES = Integer.MAX_VALUE;
 
-    /** Cold ledger row — {@code QUEUED} at enqueue; {@code attempt_count}/{@code max_attempts} are placeholders until the terminal snapshot copies them from the hot row. */
+    // A row that has never been claimed has no current execution — the first claim's +1 lands the
+    // counter on 0, the first execution's own ordinal (D33). See TmInFlightEntity.retryCount.
+    static final int NO_EXECUTION_YET = -1;
+
+    /** Cold ledger row — {@code QUEUED} at enqueue; {@code attempt_count}/{@code retry_count}/{@code max_retries} are placeholders until the terminal snapshot copies them from the hot row. */
     static TmTaskEntity newQueuedRow(TaskRef taskRef) {
         TmTaskEntity entity = new TmTaskEntity();
         entity.setTaskType(taskRef.taskType());
         entity.setTaskId(taskRef.taskId());
         entity.setStatus(TaskStatus.QUEUED);
         entity.setAttemptCount(0);
-        entity.setMaxAttempts(UNBOUNDED_MAX_ATTEMPTS);
+        entity.setRetryCount(0);
+        entity.setMaxRetries(UNBOUNDED_MAX_RETRIES);
         Instant now = Instant.now();
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
@@ -43,20 +48,22 @@ final class TmTaskEntities {
      * bulk/external populate path bypasses this and inserts an unreserved
      * ({@code status = null}, {@code node_id = null}) row directly.
      *
-     * <p>{@code attemptCount} is caller-supplied rather than hardcoded — the
-     * hot row's counter always represents "the current attempt's own
+     * <p>Both counters are caller-supplied rather than hardcoded — the hot
+     * row's {@code attempt_count} always represents "the current attempt's own
      * number," seeded as the cold row's {@code attempt_count + 1} (1 for a
-     * brand-new task at enqueue, since its cold row is always freshly 0; the
-     * carried-forward value at rerun/promote).
+     * brand-new task at enqueue, since its cold row is always freshly 0), and
+     * {@code retry_count} restarts at {@link #NO_EXECUTION_YET} for every new
+     * attempt (D33), so that attempt's first claim bills it up to 0.
      */
-    static TmInFlightEntity newReservedRow(TaskRef taskRef, String nodeId, int attemptCount) {
+    static TmInFlightEntity newReservedRow(TaskRef taskRef, String nodeId, int attemptCount, int retryCount) {
         TmInFlightEntity entity = new TmInFlightEntity();
         entity.setTaskType(taskRef.taskType());
         entity.setTaskId(taskRef.taskId());
         entity.setStatus(TaskStatus.QUEUED);
         entity.setNodeId(nodeId);
         entity.setAttemptCount(attemptCount);
-        entity.setMaxAttempts(UNBOUNDED_MAX_ATTEMPTS);
+        entity.setRetryCount(retryCount);
+        entity.setMaxRetries(UNBOUNDED_MAX_RETRIES);
         Instant now = Instant.now();
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);

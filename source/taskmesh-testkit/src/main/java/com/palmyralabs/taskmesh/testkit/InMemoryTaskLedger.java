@@ -1,5 +1,6 @@
 package com.palmyralabs.taskmesh.testkit;
 
+import com.palmyralabs.taskmesh.api.AttemptCounters;
 import com.palmyralabs.taskmesh.api.TaskLedger;
 import com.palmyralabs.taskmesh.api.TaskRef;
 import lombok.RequiredArgsConstructor;
@@ -29,7 +30,7 @@ public class InMemoryTaskLedger implements TaskLedger {
     }
 
     @Override
-    public int attemptCount(TaskRef taskRef) {
-        return store.attemptCount(taskRef);
+    public AttemptCounters counters(TaskRef taskRef) {
+        return store.counters(taskRef);
     }
 }

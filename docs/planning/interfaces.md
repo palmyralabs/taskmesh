@@ -22,16 +22,44 @@ consuming project.
 **Candidate implementations**: consumer-supplied, per task_type. E.g. (in the
 originating toolkit, not in taskmesh itself) `PolicyMigrationProcessor`.
 
-**Open**: exact method signature — one `process(TaskContext ctx)` returning a
-result/outcome type, or a richer contract split like workflow's
-`activate/complete/terminate`? Leaning toward the single-method flat contract
-(matches D2 — flat unit of work, no multi-step sequencing in core).
+**Resolved** (was: one flat `process()` or a richer `activate/complete/terminate`
+split?). `process(TaskContext)` stays the single flat unit of work (D2), and the
+two lifecycle signals a consumer genuinely cannot derive for itself are added
+beside it as **default no-ops**, so existing implementations are unaffected
+(D34):
+
+```java
+void process(TaskContext ctx) throws Exception;
+
+default void onStart(TaskContext ctx) { }          // every execution, before process()
+default void onTerminal(TerminalContext ctx) { }   // once, when the task goes terminal
+```
+
+- `onTerminal` exists because a processor **cannot** work terminality out
+  itself: it knows an execution threw, but whether the retry budget is now spent
+  is decided inside `release()`/`claim()`, after the throw. It runs *inside the
+  terminal transaction*, so a consumer's derived projection cannot diverge from
+  the queue's terminal state — and so a throw vetoes the transition.
+- `onStart` carries the signal that would otherwise need an `onRerun`: the D33
+  pair identifies the start. `(1, 0)` first ever, `(>1, 0)` **an operator
+  re-ran it**, `(*, >0)` a retry or reclaim. Writing only when
+  `retryCount == 0` is one row-touch per attempt.
+
+`TypedTaskProcessor` bridges both with the payload cast, and the three bridges
+differ on purpose: `process` and `onStart` reject a null payload, `onTerminal`
+passes it through (a terminal can be reached with no execution behind it).
 
 ---
 
 ## TaskContext — [draft]
 
-The toolbox passed into `TaskProcessor.process()`.
+The toolbox passed into `TaskProcessor.process()` and `onStart()`. Identity,
+counters and payload come from `TaskInfo`, which it shares with
+`TerminalContext`; what `TaskContext` adds is the live-execution lifecycle.
+`TerminalContext` is deliberately a *separate* type rather than the same one —
+`checkpoint()` would drive lease renewal on a task that is ending, inside the
+transaction ending it, and sharing one type would turn a compile-time
+distinction into a runtime one (D34).
 
 - Responsible for: exposing `taskId`/`taskType`/`payload`, ownership/pause/
   shutdown checks, progress/heartbeat reporting, error logging for sub-items.
@@ -58,6 +86,13 @@ discussion: these three always have to agree with each other).
   expiry, renewal.
 - Not responsible for: deciding *when* to renew (that's driven by `-engine`'s
   scheduled tick, informed by `HeartbeatStrategy` per Q-HEARTBEAT).
+- Not responsible for: **opening a transaction** (D34). `claim`/`renew`/
+  `release` run inside the caller's, which is what lets the engine commit a
+  terminal transition and the consumer's `onTerminal` as one unit — a boundary
+  opened down here could never offer that to code above it. Callers must supply
+  one; the engine does, via `TransactionRunner`. `TaskLedger.enqueue`/`rerun`
+  keep their own, since nothing needs to compose with them and `enqueue`'s
+  duplicate-race swallow only works while isolated.
 
 **Candidate implementations**: `taskmesh-postgres` (the reference/default,
 matches task-execution.md's `in_flight` table design). A `taskmesh-testkit`
@@ -75,12 +110,14 @@ richer model deferred until real multi-node contention data exists.
 
 Owns retry budget and backoff shape, parameterized per `task_type`.
 
-- Responsible for: `maxAttempts`, backoff curve (delay given attempt number).
+- Responsible for: `maxRetries`, backoff curve (delay given retry number).
+  *(Superseded by D33: the bound is now retries-within-an-attempt, and the
+  curve keys off `retry_count`, not `attempt_count`.)*
 - Not responsible for: deciding whether a given failure is retryable at all
   — that's `FailureClassifier`.
 
 **Candidate implementations**: `ExponentialBackoffRetryPolicy` (default,
-matches task-execution.md: 2min × 2^(n-1), capped 1h, max_attempts=10) as a
+matches task-execution.md: 2min × 2^(n-1), capped 1h, 10 retries — D33) as a
 `taskmesh-engine`-provided default; consumers can supply per-task_type
 overrides.
 

@@ -1,5 +1,6 @@
 package com.palmyralabs.taskmesh.max;
 
+import com.palmyralabs.taskmesh.max.entity.TaskId;
 import com.palmyralabs.taskmesh.max.entity.TmInFlightEntity;
 import com.palmyralabs.taskmesh.max.entity.TmTaskEntity;
 import com.palmyralabs.taskmesh.max.repository.TmInFlightRepository;
@@ -44,11 +45,21 @@ public class JpaBacklogPromoter implements BacklogPromoter {
                 return 0;
             }
             for (TmTaskEntity task : backlog) {
+                // Same guard NoopBacklogPromoter carries, for the same reason: save() on a
+                // manually-assigned composite key is an upsert, not insert-or-throw, so an
+                // unguarded save over an existing hot row silently resets a claimed task to
+                // unclaimed and loses the current owner's claim. "Unpromoted" normally implies
+                // "no hot row" — promotion stamps promoted_at in this very transaction — but it is
+                // one missed stamp away from not implying it, and the failure is silent.
+                if (inFlightRepository.findById(new TaskId(task.getTaskType(), task.getTaskId())).isPresent()) {
+                    continue;
+                }
                 // Seeded from the cold row's attempt_count + 1 (see TaskLedger#rerun) — always 1 in
                 // practice here too, since a backlogged task by definition has no hot row yet.
+                // retry_count starts at -1 (the first claim bills it to 0): a new attempt always restarts the inner counter (D33).
                 TmInFlightEntity hot = TmTaskEntities.newReservedRow(
                         new TaskRef(task.getTaskType(), task.getTaskId(), task.getPartitionKey()), nodeId,
-                        task.getAttemptCount() + 1);
+                        task.getAttemptCount() + 1, TmTaskEntities.NO_EXECUTION_YET);
                 inFlightRepository.save(hot);
             }
             List<String> taskIds = backlog.stream().map(TmTaskEntity::getTaskId).toList();

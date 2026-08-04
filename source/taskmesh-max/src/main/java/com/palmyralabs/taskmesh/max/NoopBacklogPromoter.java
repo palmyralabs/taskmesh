@@ -41,6 +41,8 @@ public class NoopBacklogPromoter implements BacklogPromoter {
      * here in practice, since promotion only ever runs for a task that has
      * no hot row yet (i.e. has never been attempted), but read fresh rather
      * than hardcoded so this stays correct if that ever stops holding.
+     * {@code retry_count} always starts at 0: promotion opens a new attempt,
+     * and the inner counter restarts with every attempt (D33).
      */
     @Override
     public void onEnqueue(TaskRef taskRef, String nodeId) {
@@ -52,7 +54,7 @@ public class NoopBacklogPromoter implements BacklogPromoter {
             Instant now = Instant.now();
             PartitionedTaskId taskId = new PartitionedTaskId(taskRef.taskType(), taskRef.taskId(), taskRef.partitionKey());
             int attemptCount = taskRepository.findById(taskId).map(TmTaskEntity::getAttemptCount).orElse(0) + 1;
-            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeId, attemptCount));
+            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeId, attemptCount, TmTaskEntities.NO_EXECUTION_YET));
             taskRepository.findById(taskId).ifPresent(task -> {
                 task.setPromotedAt(now);
                 taskRepository.save(task);

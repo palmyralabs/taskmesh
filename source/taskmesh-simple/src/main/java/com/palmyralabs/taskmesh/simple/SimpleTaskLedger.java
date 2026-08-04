@@ -6,8 +6,10 @@ import com.palmyralabs.taskmesh.simple.entity.TmTaskEntity;
 import com.palmyralabs.taskmesh.simple.repository.TmInFlightRepository;
 import com.palmyralabs.taskmesh.simple.repository.TmTaskRepository;
 
+import com.palmyralabs.taskmesh.api.AttemptCounters;
 import com.palmyralabs.taskmesh.api.ClaimOutcome;
 import com.palmyralabs.taskmesh.api.ClaimStrategy;
+import com.palmyralabs.taskmesh.api.DuplicateEnqueueException;
 import com.palmyralabs.taskmesh.api.NodeInfoProvider;
 import com.palmyralabs.taskmesh.api.ReleaseOutcome;
 import com.palmyralabs.taskmesh.api.ReleaseRequest;
@@ -32,6 +34,21 @@ import java.util.List;
  * to the hot {@link TmInFlightRepository} exclusively; {@code tm_task} is
  * written only at enqueue and (as a snapshot) on the terminal transition.
  * Node identity comes from the given {@link NodeInfoProvider} (D17).
+ *
+ * <p><b>{@code ClaimStrategy}'s three methods open no transaction of their own</b> —
+ * the caller supplies the boundary (the engine does, via {@code TransactionRunner}).
+ * That is what lets a terminal transition and the consumer's {@code onTerminal}
+ * callback commit or roll back as one unit, which a boundary opened down here could
+ * never offer to code above it. {@code TaskLedger}'s {@code enqueue}/{@code rerun}
+ * keep their own, since nothing needs to compose with them.
+ *
+ * <p><b>One lock order, everywhere: hot row, then cold.</b> Every write path here
+ * touches {@code tm_in_flight} before {@code tm_task} — claim, release, rerun and
+ * enqueue alike. It is forced by D33's claim-time termination, which already holds
+ * the hot row by the time it discovers the task is terminal and so can never take
+ * the cold row first; once one path is fixed that way, every other path must match
+ * or they deadlock against each other (D34).
+ *
  */
 @RequiredArgsConstructor
 public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
@@ -52,9 +69,37 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
 
     @Override
     public ClaimOutcome claim(TaskRef taskRef) {
-        Boolean won = transactionTemplate.execute(status ->
-                inFlightRepository.claimSingleNode(taskRef.taskType(), taskRef.taskId(), nodeInfoProvider.nodeId(), Instant.now()) == 1);
-        return Boolean.TRUE.equals(won) ? ClaimOutcome.WON : ClaimOutcome.LOST;
+        if (inFlightRepository.claimSingleNode(taskRef.taskType(), taskRef.taskId(),
+                nodeInfoProvider.nodeId(), Instant.now()) != 1) {
+            return ClaimOutcome.LOST;
+        }
+        return admitOrTerminate(taskRef);
+    }
+
+    /**
+     * Budget is spent at claim time (D33). This tier has no lease, so the "node died
+     * without releasing" case it guards against is instead "this node was killed and
+     * {@link #recoverOwnClaims} handed the row back at startup" — same shape, same
+     * need: without a claim-side check that task would be re-claimed forever.
+     * Fenced by the claim this call just won; the terminal write runs in its own
+     * transaction to keep the {@code tm_task} → {@code tm_in_flight} lock order.
+     */
+    private ClaimOutcome admitOrTerminate(TaskRef taskRef) {
+        TmInFlightEntity hot = inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId()))
+                .orElseThrow(() -> new IllegalStateException("tm_in_flight row missing for " + taskRef + " despite a won claim"));
+        if (hot.getRetryCount() <= Math.min(hot.getMaxRetries(), retryPolicy.maxRetries())) {
+            return ClaimOutcome.WON;
+        }
+        // Joins the caller's transaction — see MultiNodeTaskLedger#terminateExhausted. The claim
+        // increment that tipped the budget over belongs to an execution that will never run, so
+        // the snapshot records the last ordinal that actually did.
+        taskRepository.terminalUpdate(taskRef.taskType(), taskRef.taskId(), TaskStatus.FAILED,
+                hot.getAttemptCount(), hot.getRetryCount() - 1, hot.getMaxRetries(),
+                MultiNodeTaskLedger.RETRY_BUDGET_EXHAUSTED,
+                "Retry budget exhausted with no reported outcome — the previous execution's node "
+                        + "died without releasing", Instant.now());
+        inFlightRepository.deleteByTaskTypeAndTaskId(taskRef.taskType(), taskRef.taskId());
+        return ClaimOutcome.EXHAUSTED;
     }
 
     @Override
@@ -69,31 +114,46 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
 
     @Override
     public ReleaseOutcome release(TaskRef taskRef, ReleaseRequest request) {
-        return transactionTemplate.execute(status -> switch (request.disposition()) {
+        return switch (request.disposition()) {
             case COMPLETED -> terminalRelease(taskRef, TaskStatus.COMPLETED, request);
             case FAILED_TERMINAL -> terminalRelease(taskRef, TaskStatus.FAILED, request);
-            case REQUEUE -> requeueRelease(taskRef, request);
-        });
+            case RETRY -> retryRelease(taskRef, request);
+            case YIELD -> yieldRelease(taskRef);
+        };
     }
 
     private ReleaseOutcome terminalRelease(TaskRef taskRef, TaskStatus terminalStatus, ReleaseRequest request) {
-        // Lock the cold row FIRST — same order as enqueue (tm_task -> tm_in_flight) — to avoid a deadlock
-        // with a concurrent enqueue of the same task.
-        taskRepository.lockByPk(taskRef.taskType(), taskRef.taskId());
+        // Hot row FIRST, then cold — the one lock order every path in this class uses, including
+        // D33's claim-time termination, which cannot take the cold row first because the claim
+        // UPDATE has already taken the hot one. Locking tm_task first here instead (as this used
+        // to) gives release and a claim-time termination of the same task opposite orders, and a
+        // Postgres torture run deadlocked on it 40 times out of 40 — the exact shape a stale owner
+        // releasing work another node has just reclaimed produces. Ordering against enqueue is not
+        // at risk: enqueue writes nothing for a task that already exists, and a task that does not
+        // exist has nothing to release.
         TmInFlightEntity hot = inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId())).orElse(null);
         int deleted = inFlightRepository.deleteOwned(taskRef.taskType(), taskRef.taskId(), nodeInfoProvider.nodeId());
         if (deleted == 0 || hot == null) {
             return ReleaseOutcome.LOST_OWNERSHIP;
         }
         taskRepository.terminalUpdate(taskRef.taskType(), taskRef.taskId(), terminalStatus,
-                hot.getAttemptCount(), hot.getMaxAttempts(), request.reasonCode(), request.errorSummary(), Instant.now());
+                hot.getAttemptCount(), hot.getRetryCount(), hot.getMaxRetries(), request.reasonCode(), request.errorSummary(), Instant.now());
         return ReleaseOutcome.OK;
     }
 
-    private ReleaseOutcome requeueRelease(TaskRef taskRef, ReleaseRequest request) {
+    /**
+     * Retryable failure — burns one unit of retry budget. The increment lands
+     * <b>before</b> the exhaustion comparison (D33): post-increment,
+     * {@code retry_count} names the execution that would run next, so
+     * {@code max_retries = N} still allows N+1 executions per attempt, exactly
+     * the budget the old pre-increment {@code attempt_count > max_attempts}
+     * check gave. {@code attempt_count} is never touched here — only an
+     * operator {@code rerun} moves the outer counter.
+     */
+    private ReleaseOutcome retryRelease(TaskRef taskRef, ReleaseRequest request) {
         Instant now = Instant.now();
-        // Lock the cold row first (same rationale as terminalRelease) — the exhaustion branch writes tm_task.
-        taskRepository.lockByPk(taskRef.taskType(), taskRef.taskId());
+        // Hot row first, then cold in the exhaustion branch — same single lock order as
+        // terminalRelease, for the same reason.
         int fenced = inFlightRepository.resetUnclaimed(taskRef.taskType(), taskRef.taskId(), nodeInfoProvider.nodeId(), now);
         if (fenced == 0) {
             return ReleaseOutcome.LOST_OWNERSHIP;
@@ -101,25 +161,36 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
 
         TmInFlightEntity hot = inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId()))
                 .orElseThrow(() -> new IllegalStateException("tm_in_flight row missing for " + taskRef + " despite a fenced hot-row release"));
-        int effectiveMaxAttempts = Math.min(hot.getMaxAttempts(), retryPolicy.maxAttempts());
+        int nextRetry = hot.getRetryCount() + 1;
+        int effectiveMaxRetries = Math.min(hot.getMaxRetries(), retryPolicy.maxRetries());
 
-        // Exhaustion is checked against the attempt that just ran (hot.getAttemptCount() — its own number,
-        // set at claim time), not a "next candidate" — this preserves the historical retry-budget behavior
-        // (maxAttempts=N allows N+1 total attempts) independent of how attempt_count is now numbered.
-        if (hot.getAttemptCount() > effectiveMaxAttempts) {
+        if (nextRetry > effectiveMaxRetries) {
             taskRepository.terminalUpdate(taskRef.taskType(), taskRef.taskId(), TaskStatus.FAILED,
-                    hot.getAttemptCount(), hot.getMaxAttempts(), request.reasonCode(), request.errorSummary(), now);
+                    hot.getAttemptCount(), hot.getRetryCount(), hot.getMaxRetries(), request.reasonCode(), request.errorSummary(), now);
             inFlightRepository.deleteByTaskTypeAndTaskId(taskRef.taskType(), taskRef.taskId());
             return ReleaseOutcome.EXHAUSTED;
         }
 
-        // Reset to unclaimed (resetUnclaimed above) plus the bumped counter and backoff gate — no affinity, so node stays cleared.
-        int nextAttempt = hot.getAttemptCount() + 1;
-        hot.setAttemptCount(nextAttempt);
-        hot.setNextRetryAt(retryPolicy.nextRetryAt(nextAttempt));
+        // Within budget: reset to unclaimed (resetUnclaimed above) — no affinity, so node stays
+        // cleared — plus the gate for the next execution. Neither counter is written here;
+        // claim() spends the budget (D33), so bumping it again would double-bill.
+        hot.setNextRetryAt(retryPolicy.nextRetryAt(nextRetry));
         hot.setUpdatedAt(now);
         inFlightRepository.save(hot);
         return ReleaseOutcome.OK;
+    }
+
+    /**
+     * Cooperative hand-back (D33) — parks the row in {@code YIELDED} with no
+     * backoff gate, so it is immediately claimable again once whatever caused
+     * the yield clears, and the claim that picks it back up spends no budget
+     * (that is what the distinct status is for). Fenced by {@code node_id}
+     * like every other release.
+     */
+    private ReleaseOutcome yieldRelease(TaskRef taskRef) {
+        int fenced = inFlightRepository.markYielded(taskRef.taskType(), taskRef.taskId(),
+                nodeInfoProvider.nodeId(), Instant.now());
+        return fenced == 1 ? ReleaseOutcome.OK : ReleaseOutcome.LOST_OWNERSHIP;
     }
 
     @Override
@@ -128,10 +199,14 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
     }
 
     @Override
-    public int attemptCount(TaskRef taskRef) {
+    public AttemptCounters counters(TaskRef taskRef) {
         return inFlightRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId()))
-                .map(TmInFlightEntity::getAttemptCount)
-                .orElse(0);
+                .map(hot -> new AttemptCounters(hot.getAttemptCount(), hot.getRetryCount()))
+                // No hot row means a terminal outcome already deleted it — including claim-time
+                // exhaustion (D33) — and the cold snapshot is then the truth.
+                .orElseGet(() -> taskRepository.findById(new TaskId(taskRef.taskType(), taskRef.taskId()))
+                        .map(cold -> new AttemptCounters(cold.getAttemptCount(), cold.getRetryCount()))
+                        .orElse(AttemptCounters.NONE));
     }
 
     /**
@@ -139,12 +214,11 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
      * one transaction; no-op if the task was never enqueued. Refuses
      * (throws) if a hot row already exists in any status — see
      * {@link #rerun} in {@code TaskLedger} for why. The new hot row's
-     * {@code attempt_count} is seeded from the cold row's
-     * {@code attempt_count + 1} rather than resetting to 0 — {@code
-     * tm_attempt_history} is keyed by {@code (taskType, taskId,
-     * attemptNumber)}, so restarting the counter would make the next
-     * attempt's history write collide with and silently overwrite a
-     * pre-rerun row of the same number.
+     * {@code attempt_count} is the cold row's {@code attempt_count + 1} and
+     * its {@code retry_count} restarts at <b>-1</b>, so its first claim bills it to 0 (D33), so a task that
+     * exhausted its retries gets a full fresh budget. Safe only because
+     * {@code tm_attempt_history} is keyed by <b>both</b> counters, so
+     * {@code (1, 3)} and {@code (2, 0)} are distinct rows by construction.
      */
     @Override
     public void rerun(TaskRef taskRef) {
@@ -162,7 +236,7 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
                                 + "recovers only via recoverOwnClaims() on that node's next restart.");
             });
             inFlightRepository.deleteByTaskTypeAndTaskId(taskRef.taskType(), taskRef.taskId());
-            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId(), existing.getAttemptCount() + 1));
+            inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId(), existing.getAttemptCount() + 1, TmTaskEntities.NO_EXECUTION_YET));
             taskRepository.forceRequeue(taskRef.taskType(), taskRef.taskId(), Instant.now());
         });
     }
@@ -170,15 +244,17 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
     @Override
     public void enqueue(TaskRef taskRef) {
         try {
-            transactionTemplate.executeWithoutResult(status -> {
-                TaskId id = new TaskId(taskRef.taskType(), taskRef.taskId());
-                if (taskRepository.findById(id).isEmpty()) {
-                    taskRepository.save(TmTaskEntities.newQueuedRow(taskRef));
-                    inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId(), 1));
-                }
-            });
+            TaskId id = new TaskId(taskRef.taskType(), taskRef.taskId());
+            if (taskRepository.findById(id).isEmpty()) {
+                // Hot row before cold, the one lock order every path in this class uses. Nothing
+                // could deadlock here either way — this branch only runs when the task does not
+                // exist yet, so there is nothing for another node to be claiming or releasing —
+                // but a single order with no exceptions is what keeps the invariant checkable.
+                inFlightRepository.save(TmTaskEntities.newReservedRow(taskRef, nodeInfoProvider.nodeId(), 1, TmTaskEntities.NO_EXECUTION_YET));
+                taskRepository.save(TmTaskEntities.newQueuedRow(taskRef));
+            }
         } catch (DataIntegrityViolationException e) {
-            // Lost the race — another caller already inserted this TaskRef.
+            throw new DuplicateEnqueueException(taskRef, e);
         }
     }
 }

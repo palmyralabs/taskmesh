@@ -10,7 +10,8 @@ import lombok.RequiredArgsConstructor;
 
 /**
  * BATCH profile's {@code HistoryWriter} (infra-implementations.md Variant A,
- * cleanser-style {@code exec_proc_run} pattern) — one row per attempt,
+ * cleanser-style {@code exec_proc_run} pattern) — one row per execution
+ * (keyed by both D33 counters),
  * INSERTed on {@link HistoryEventType#STARTED}, UPDATEd in place on the
  * attempt's terminal outcome. {@code RETRIED}/{@code OWNERSHIP_LOST}/
  * {@code PAUSED}/{@code HEARTBEAT} update the same row's {@code detail}
@@ -25,13 +26,14 @@ public class AttemptHistoryWriter implements HistoryWriter {
     @Override
     public void record(HistoryEvent event) {
         TmAttemptHistoryId id = new TmAttemptHistoryId(event.taskRef().taskType(), event.taskRef().taskId(),
-                event.attemptNumber(), event.taskRef().partitionKey());
+                event.attemptCount(), event.retryCount(), event.taskRef().partitionKey());
 
         if (event.type() == HistoryEventType.STARTED) {
             TmAttemptHistoryEntity entity = new TmAttemptHistoryEntity();
             entity.setTaskType(id.getTaskType());
             entity.setTaskId(id.getTaskId());
-            entity.setAttemptNumber(id.getAttemptNumber());
+            entity.setAttemptCount(id.getAttemptCount());
+            entity.setRetryCount(id.getRetryCount());
             entity.setPartitionKey(id.getPartitionKey());
             entity.setStatus(HistoryEventType.STARTED);
             entity.setStartedAt(event.occurredAt());
@@ -53,7 +55,8 @@ public class AttemptHistoryWriter implements HistoryWriter {
             TmAttemptHistoryEntity entity = new TmAttemptHistoryEntity();
             entity.setTaskType(id.getTaskType());
             entity.setTaskId(id.getTaskId());
-            entity.setAttemptNumber(id.getAttemptNumber());
+            entity.setAttemptCount(id.getAttemptCount());
+            entity.setRetryCount(id.getRetryCount());
             entity.setPartitionKey(id.getPartitionKey());
             entity.setStatus(event.type());
             entity.setStartedAt(event.occurredAt());

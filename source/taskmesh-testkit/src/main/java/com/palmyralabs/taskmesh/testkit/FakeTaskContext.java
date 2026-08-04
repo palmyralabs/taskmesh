@@ -14,7 +14,8 @@ import com.palmyralabs.taskmesh.api.TaskRef;
 public class FakeTaskContext implements TaskContext {
 
     private final TaskRef taskRef;
-    private final int attemptNumber;
+    private final int attemptCount;
+    private final int retryCount;
     private final Object payload;
     private final InMemoryProgressReporter progress = new InMemoryProgressReporter();
     private final InMemoryErrorLogger errorLogger = new InMemoryErrorLogger();
@@ -27,7 +28,8 @@ public class FakeTaskContext implements TaskContext {
 
     private FakeTaskContext(Builder builder) {
         this.taskRef = builder.taskRef;
-        this.attemptNumber = builder.attemptNumber;
+        this.attemptCount = builder.attemptCount;
+        this.retryCount = builder.retryCount;
         this.payload = builder.payload;
         this.onCheckpoint = builder.onCheckpoint;
     }
@@ -42,8 +44,13 @@ public class FakeTaskContext implements TaskContext {
     }
 
     @Override
-    public int attemptNumber() {
-        return attemptNumber;
+    public int attemptCount() {
+        return attemptCount;
+    }
+
+    @Override
+    public int retryCount() {
+        return retryCount;
     }
 
     @Override
@@ -113,7 +120,8 @@ public class FakeTaskContext implements TaskContext {
     public static class Builder {
         private final TaskRef taskRef;
         private final Object payload;
-        private int attemptNumber = 1;
+        private int attemptCount = 1;
+        private int retryCount = 0;
         private Runnable onCheckpoint;
 
         private Builder(TaskRef taskRef, Object payload) {
@@ -122,8 +130,14 @@ public class FakeTaskContext implements TaskContext {
         }
 
         /** Defaults to 1 (a task's first attempt) if not set. */
-        public Builder attemptNumber(int attemptNumber) {
-            this.attemptNumber = attemptNumber;
+        public Builder attemptCount(int attemptCount) {
+            this.attemptCount = attemptCount;
+            return this;
+        }
+
+        /** Defaults to 0 (the attempt's first execution) if not set. */
+        public Builder retryCount(int retryCount) {
+            this.retryCount = retryCount;
             return this;
         }
 

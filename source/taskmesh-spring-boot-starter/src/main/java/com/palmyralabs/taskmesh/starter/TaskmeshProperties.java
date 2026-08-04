@@ -26,7 +26,7 @@ public class TaskmeshProperties {
     private long claimTimeoutSeconds = 300;
     /** How long a freshly enqueued QUEUED row stays reserved to the enqueuing node before another node may steal it. */
     private long reservationSeconds = 60;
-    private int maxAttempts = 10;
+    private int maxRetries = 10;
     private long backoffBaseMinutes = 2;
     private long backoffCapMinutes = 60;
     private Jitter backoffJitter = Jitter.NONE;

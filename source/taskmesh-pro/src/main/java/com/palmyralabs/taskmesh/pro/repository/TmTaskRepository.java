@@ -17,21 +17,21 @@ import java.util.Optional;
 /**
  * Cold ledger repository — written only at enqueue and on the terminal
  * transition; never read by query/claim/release (all of which refer to the
- * hot {@link TmInFlightRepository} exclusively). The terminal write snapshots
- * the final {@code attempt_count}/{@code max_attempts} copied from the hot row
+ * hot {@link TmInFlightRepository} exclusively). The terminal write snapshots the final
+ * {@code attempt_count}/{@code retry_count}/{@code max_retries} copied from the hot row
  * (the live counters live there now) before that row is deleted.
  */
 public interface TmTaskRepository extends JpaRepository<TmTaskEntity, TaskId> {
 
-    /** Terminal snapshot — {@code attemptCount}/{@code maxAttempts} are copied from the hot row by the caller. */
+    /** Terminal snapshot — {@code attemptCount}/{@code retryCount}/{@code maxRetries} are copied from the hot row by the caller. */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmTaskEntity t SET t.status = :status, "
-            + "t.attemptCount = :attemptCount, t.maxAttempts = :maxAttempts, "
+            + "t.attemptCount = :attemptCount, t.retryCount = :retryCount, t.maxRetries = :maxRetries, "
             + "t.reasonCode = :reasonCode, t.errorSummary = :errorSummary, t.updatedAt = :now "
             + "WHERE t.taskType = :taskType AND t.taskId = :taskId")
     int terminalUpdate(@Param("taskType") String taskType, @Param("taskId") String taskId,
                         @Param("status") TaskStatus status, @Param("attemptCount") int attemptCount,
-                        @Param("maxAttempts") int maxAttempts, @Param("reasonCode") String reasonCode,
+                        @Param("retryCount") int retryCount, @Param("maxRetries") int maxRetries, @Param("reasonCode") String reasonCode,
                         @Param("errorSummary") String errorSummary, @Param("now") Instant now);
 
     /**

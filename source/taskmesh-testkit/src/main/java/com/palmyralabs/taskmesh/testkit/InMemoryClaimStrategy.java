@@ -11,7 +11,7 @@ import com.palmyralabs.taskmesh.api.TaskRef;
 import lombok.RequiredArgsConstructor;
 
 /**
- * Same WON/LOST/LOST_OWNERSHIP semantics as a real lease-based ClaimStrategy,
+ * Same WON/LOST/EXHAUSTED/LOST_OWNERSHIP semantics as a real lease-based ClaimStrategy,
  * backed by an in-memory {@link InMemoryTaskStore} instead of Postgres.
  * Node identity comes from the given {@link NodeInfoProvider} (D17) — build
  * one instance per simulated node, sharing one {@link InMemoryTaskStore},
@@ -26,7 +26,7 @@ public class InMemoryClaimStrategy implements ClaimStrategy {
 
     @Override
     public ClaimOutcome claim(TaskRef taskRef) {
-        return store.claim(taskRef, nodeInfoProvider.nodeId());
+        return store.claim(taskRef, nodeInfoProvider.nodeId(), retryPolicy);
     }
 
     @Override

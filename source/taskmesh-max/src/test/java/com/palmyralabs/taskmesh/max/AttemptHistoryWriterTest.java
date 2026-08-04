@@ -28,19 +28,19 @@ class AttemptHistoryWriterTest {
         AttemptHistoryWriter writer = new AttemptHistoryWriter(repository);
         TaskRef ref = new TaskRef("T", "attempt-1", "P1");
 
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.STARTED, null, Instant.now(), "node-1"));
-        TmAttemptHistoryId id = new TmAttemptHistoryId("T", "attempt-1", 1, "P1");
+        writer.record(new HistoryEvent(ref, 1, 0, HistoryEventType.STARTED, null, Instant.now(), "node-1"));
+        TmAttemptHistoryId id = new TmAttemptHistoryId("T", "attempt-1", 1, 0, "P1");
         TmAttemptHistoryEntity afterStart = repository.findById(id).orElseThrow();
         assertEquals(HistoryEventType.STARTED, afterStart.getStatus());
         assertNotNull(afterStart.getStartedAt());
         assertNull(afterStart.getEndedAt());
 
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.HEARTBEAT, "still going", Instant.now(), "node-1"));
+        writer.record(new HistoryEvent(ref, 1, 0, HistoryEventType.HEARTBEAT, "still going", Instant.now(), "node-1"));
         TmAttemptHistoryEntity afterHeartbeat = repository.findById(id).orElseThrow();
         assertEquals(HistoryEventType.HEARTBEAT, afterHeartbeat.getStatus(), "non-terminal events still update the same row");
         assertNull(afterHeartbeat.getEndedAt(), "non-terminal events must not close the row");
 
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.COMPLETED, null, Instant.now(), "node-1"));
+        writer.record(new HistoryEvent(ref, 1, 0, HistoryEventType.COMPLETED, null, Instant.now(), "node-1"));
         TmAttemptHistoryEntity afterComplete = repository.findById(id).orElseThrow();
         assertEquals(HistoryEventType.COMPLETED, afterComplete.getStatus());
         assertNotNull(afterComplete.getEndedAt());
@@ -53,9 +53,9 @@ class AttemptHistoryWriterTest {
         AttemptHistoryWriter writer = new AttemptHistoryWriter(repository);
         TaskRef ref = new TaskRef("T", "no-processor", "P1");
 
-        writer.record(new HistoryEvent(ref, 1, HistoryEventType.FAILED, "NO_PROCESSOR", Instant.now(), "node-1"));
+        writer.record(new HistoryEvent(ref, 1, 0, HistoryEventType.FAILED, "NO_PROCESSOR", Instant.now(), "node-1"));
 
-        TmAttemptHistoryEntity row = repository.findById(new TmAttemptHistoryId("T", "no-processor", 1, "P1")).orElseThrow();
+        TmAttemptHistoryEntity row = repository.findById(new TmAttemptHistoryId("T", "no-processor", 1, 0, "P1")).orElseThrow();
         assertEquals(HistoryEventType.FAILED, row.getStatus());
         assertNotNull(row.getEndedAt());
     }

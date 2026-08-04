@@ -1,5 +1,6 @@
 package com.palmyralabs.taskmesh.max.starter;
 
+import com.palmyralabs.taskmesh.max.SpringTransactionRunner;
 import com.palmyralabs.taskmesh.api.AuditEventSink;
 import com.palmyralabs.taskmesh.api.BacklogPromoter;
 import com.palmyralabs.taskmesh.api.ClaimStrategy;
@@ -71,7 +72,7 @@ public class TaskmeshEngineAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean
     public RetryPolicy retryPolicy(TaskmeshProperties properties) {
-        return new ExponentialBackoffRetryPolicy(properties.getMaxAttempts(),
+        return new ExponentialBackoffRetryPolicy(properties.getMaxRetries(),
                 Duration.ofMinutes(properties.getBackoffBaseMinutes()), Duration.ofMinutes(properties.getBackoffCapMinutes()),
                 properties.getBackoffJitter());
     }
@@ -172,8 +173,10 @@ public class TaskmeshEngineAutoConfiguration {
             @Qualifier("taskLedger") TaskLedger taskLedger, BacklogPromoter backlogPromoter,
             HeartbeatStrategy heartbeatStrategy, PauseController pauseController, HistoryWriter historyWriter,
             AuditEventSink auditEventSink, IncidentStore incidentStore, MetricsReporter metricsReporter,
-            PayloadProviderFactory payloadProviderFactory) {
+            PayloadProviderFactory payloadProviderFactory,
+            @Qualifier("taskmeshTransactionTemplate") TransactionTemplate transactionTemplate) {
         TaskMeshEngine engine = TaskMeshEngine.builder()
+                .transactionRunner(new SpringTransactionRunner(transactionTemplate))
                 .nodeInfoProvider(nodeInfoProvider)
                 .processors(processors)
                 .claimStrategy(claimStrategy)

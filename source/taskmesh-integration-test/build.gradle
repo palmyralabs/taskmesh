@@ -18,3 +18,23 @@ tasks.withType(Test).configureEach {
     maxHeapSize = '2g'
     jvmArgs '-Xss512k'
 }
+
+// Long-running load/soak/chaos tests (LongRunningLoadTest, LargeScaleMultiNodeTest,
+// MultiNodeChaosTest — each tagged @Tag("stress")) are excluded from the default
+// `test` task, which everyone runs constantly, and live behind their own `stressTest`
+// task instead. Run explicitly: ./gradlew :taskmesh-integration-test:stressTest
+test {
+    useJUnitPlatform {
+        excludeTags 'stress'
+    }
+}
+
+tasks.register('stressTest', Test) {
+    group = 'verification'
+    description = 'Runs the long-running load/soak/chaos tests tagged @Tag("stress")'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'stress'
+    }
+}

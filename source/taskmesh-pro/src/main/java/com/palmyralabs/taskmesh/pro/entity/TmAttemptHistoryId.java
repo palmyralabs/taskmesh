@@ -17,5 +17,6 @@ import java.io.Serializable;
 public class TmAttemptHistoryId implements Serializable {
     private String taskType;
     private String taskId;
-    private int attemptNumber;
+    private int attemptCount;
+    private int retryCount;
 }

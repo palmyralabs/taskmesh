@@ -1,13 +1,12 @@
 package com.palmyralabs.taskmesh.api;
 
-public interface TaskContext {
-
-    TaskRef taskRef();
-
-    /** The current attempt's own number — 1 for a task's first attempt, incrementing on each retry. */
-    int attemptNumber();
-
-    Object payload();
+/**
+ * Handed to {@link TaskProcessor#process} for the duration of one execution.
+ * Identity, counters and payload come from {@link TaskInfo}; what this adds is
+ * the live-execution lifecycle — none of which is meaningful once the task has
+ * gone terminal, which is why {@link TerminalContext} is a separate type.
+ */
+public interface TaskContext extends TaskInfo {
 
     /**
      * Attempts lease renewal (if applicable) and refreshes ownership/pause/shutdown

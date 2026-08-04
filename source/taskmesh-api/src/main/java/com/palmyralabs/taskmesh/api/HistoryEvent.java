@@ -4,7 +4,8 @@ import java.time.Instant;
 
 public record HistoryEvent(
         TaskRef taskRef,
-        int attemptNumber,
+        int attemptCount,
+        int retryCount,
         HistoryEventType type,
         String detail,
         Instant occurredAt,

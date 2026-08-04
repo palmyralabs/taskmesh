@@ -6,6 +6,7 @@ import com.palmyralabs.taskmesh.simple.entity.TmTaskEntity;
 import com.palmyralabs.taskmesh.simple.repository.TmInFlightRepository;
 import com.palmyralabs.taskmesh.simple.repository.TmTaskRepository;
 
+import com.palmyralabs.taskmesh.api.AttemptCounters;
 import com.palmyralabs.taskmesh.api.ClaimOutcome;
 import com.palmyralabs.taskmesh.api.ReleaseOutcome;
 import com.palmyralabs.taskmesh.api.ReleaseRequest;
@@ -20,6 +21,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -74,12 +76,12 @@ class SimpleTaskLedgerTest {
     }
 
     @Test
-    void requeueReleaseGoesStraightBackToQueuedNeverReleased() {
+    void retryReleaseGoesStraightBackToQueuedNeverReleased() {
         TaskRef taskRef = new TaskRef("T", "2");
         ledger.enqueue(taskRef);
         ledger.claim(taskRef);
 
-        assertEquals(ReleaseOutcome.OK, ledger.release(taskRef, ReleaseRequest.requeue("BOOM", "fail")));
+        assertEquals(ReleaseOutcome.OK, ledger.release(taskRef, ReleaseRequest.retry("BOOM", "fail")));
 
         assertEquals(TaskStatus.QUEUED, taskRow(taskRef).getStatus());
         TmInFlightEntity hot = inFlightRow(taskRef);
@@ -136,12 +138,63 @@ class SimpleTaskLedgerTest {
 
         for (int i = 0; i < 3; i++) {
             ledger.claim(taskRef);
-            assertEquals(ReleaseOutcome.OK, ledger.release(taskRef, ReleaseRequest.requeue("BOOM", "fail " + i)));
+            assertEquals(ReleaseOutcome.OK, ledger.release(taskRef, ReleaseRequest.retry("BOOM", "fail " + i)));
         }
         ledger.claim(taskRef);
-        assertEquals(ReleaseOutcome.EXHAUSTED, ledger.release(taskRef, ReleaseRequest.requeue("BOOM", "final fail")));
+        assertEquals(ReleaseOutcome.EXHAUSTED, ledger.release(taskRef, ReleaseRequest.retry("BOOM", "final fail")));
 
         assertEquals(TaskStatus.FAILED, taskRow(taskRef).getStatus());
         assertTrue(inFlightRepository.findById(new TaskId("T", "7")).isEmpty(), "exhaustion is terminal — hot row must be deleted");
+    }
+
+    @Test
+    void yieldReturnsWorkWithoutConsumingBudgetOrSettingABackoffGate() {
+        TaskRef taskRef = new TaskRef("T", "8");
+        ledger.enqueue(taskRef);
+
+        // Burn one retry first, so "unchanged" is a real observation rather than 0 == 0.
+        assertEquals(ClaimOutcome.WON, ledger.claim(taskRef));
+        assertEquals(0, ledger.counters(taskRef).retryCount(), "the first claim bills the counter up to 0 (D33)");
+        assertEquals(ReleaseOutcome.OK, ledger.release(taskRef, ReleaseRequest.retry("BOOM", "once")));
+        assertEquals(0, inFlightRow(taskRef).getRetryCount(), "release does not bill — claim does");
+        assertNotNull(inFlightRow(taskRef).getNextRetryAt(), "but a retry does set the backoff gate");
+
+        assertEquals(ClaimOutcome.WON, ledger.claim(taskRef));
+        assertEquals(ReleaseOutcome.OK, ledger.release(taskRef, ReleaseRequest.yielded("PAUSE_REQUESTED", "cooperative pause")));
+
+        TmInFlightEntity hot = inFlightRow(taskRef);
+        assertEquals(TaskStatus.YIELDED, hot.getStatus(), "a yield parks the row in its own status");
+        assertEquals(1, hot.getAttemptCount(), "a yield is not a new attempt");
+        assertEquals(1, hot.getRetryCount(), "a yield consumes no retry budget");
+        assertNull(hot.getNextRetryAt(), "a yield clears the backoff gate — it must be immediately claimable");
+        assertEquals(ClaimOutcome.WON, ledger.claim(taskRef), "immediately re-claimable after a yield");
+    }
+
+    @Test
+    void rerunAfterExhaustionOpensANewAttemptWithAFullFreshRetryBudget() {
+        TaskRef taskRef = new TaskRef("T", "9");
+        ledger.enqueue(taskRef);
+
+        for (int i = 0; i < 3; i++) {
+            ledger.claim(taskRef);
+            assertEquals(ReleaseOutcome.OK, ledger.release(taskRef, ReleaseRequest.retry("BOOM", "fail " + i)));
+        }
+        ledger.claim(taskRef);
+        assertEquals(ReleaseOutcome.EXHAUSTED, ledger.release(taskRef, ReleaseRequest.retry("BOOM", "final fail")));
+        assertEquals(1, taskRow(taskRef).getAttemptCount(), "automatic retry never moves the outer counter");
+        assertEquals(3, taskRow(taskRef).getRetryCount(), "the cold snapshot records the retries actually burned");
+
+        ledger.rerun(taskRef);
+
+        assertEquals(new AttemptCounters(2, -1), ledger.counters(taskRef),
+                "rerun opens attempt 2 with the inner counter reset to 'no execution yet' (D33)");
+        for (int i = 0; i < 3; i++) {
+            assertEquals(ClaimOutcome.WON, ledger.claim(taskRef));
+            assertEquals(ReleaseOutcome.OK, ledger.release(taskRef, ReleaseRequest.retry("BOOM", "again " + i)),
+                    "attempt 2 must get a full fresh retry budget, not re-exhaust immediately");
+        }
+        ledger.claim(taskRef);
+        assertEquals(ReleaseOutcome.EXHAUSTED, ledger.release(taskRef, ReleaseRequest.retry("BOOM", "done")),
+                "and that fresh budget is the same size, not unbounded");
     }
 }

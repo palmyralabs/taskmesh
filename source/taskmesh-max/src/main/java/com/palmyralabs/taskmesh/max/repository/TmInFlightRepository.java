@@ -18,7 +18,8 @@ import java.util.List;
  * (D-in_flight, extended per explicit instruction: these operations refer to
  * this table and never {@code tm_task}). Everything they need lives here now —
  * {@code status} (including the {@code QUEUED} reservation state),
- * {@code node_id}, the retry counters ({@code attempt_count}/{@code max_attempts})
+ * {@code node_id}, the nested counters
+ * ({@code attempt_count}/{@code retry_count}, bounded by {@code max_retries})
  * and the backoff gate ({@code next_retry_at}). {@code tm_task} is written only
  * at enqueue and, as a cold snapshot, on the terminal transition.
  *
@@ -48,6 +49,14 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
     @Query("UPDATE TmInFlightEntity f SET "
             + "f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.CLAIMED, "
             + "f.nodeId = :nodeId, "
+            // D33: every claim starts an execution and spends one unit of retry budget. The one
+            // exception is resuming a YIELDED row, which is handing back work already paid for.
+            // Billing here rather than in release() is what makes a lost lease cost anything:
+            // the node that lost it is unfenced by construction and can never write. No sweeper
+            // (which D27's visibility-based recovery deliberately avoids) and no extra round
+            // trip. Postgres and H2 both evaluate SET expressions against the pre-UPDATE row.
+            + "f.retryCount = f.retryCount + CASE WHEN f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.YIELDED "
+            + "                                  THEN 0 ELSE 1 END, "
             + "f.claimedAt = CASE WHEN f.nodeId <> :nodeId OR f.claimedAt IS NULL OR f.claimedAt < :reclaimCutoff "
             + "                   THEN :now ELSE f.claimedAt END, "
             + "f.leaseExpiresAt = :leaseExpiresAt, f.updatedAt = :now "
@@ -55,6 +64,8 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
             + "     f.status IS NULL "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.QUEUED    AND f.nodeId = :nodeId) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.QUEUED    AND (f.nodeId IS NULL OR f.updatedAt < :reservationCutoff)) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.YIELDED   AND f.nodeId = :nodeId) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.YIELDED   AND (f.nodeId IS NULL OR f.updatedAt < :reservationCutoff)) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.CLAIMED   AND f.nodeId = :nodeId) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.RELEASED  AND f.nodeId = :nodeId AND f.updatedAt >= :affinityCutoff) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.RELEASED  AND (f.updatedAt IS NULL OR f.updatedAt < :affinityCutoff)) "
@@ -84,6 +95,8 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
             + "     f.status IS NULL "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.QUEUED    AND f.nodeId = :nodeId) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.QUEUED    AND (f.nodeId IS NULL OR f.updatedAt < :reservationCutoff)) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.YIELDED   AND f.nodeId = :nodeId) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.YIELDED   AND (f.nodeId IS NULL OR f.updatedAt < :reservationCutoff)) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.CLAIMED   AND f.nodeId = :nodeId) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.RELEASED  AND f.nodeId = :nodeId AND f.updatedAt >= :affinityCutoff) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.RELEASED  AND (f.updatedAt IS NULL OR f.updatedAt < :affinityCutoff)) "
@@ -102,6 +115,23 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
     int markReleased(@Param("taskType") String taskType, @Param("taskId") String taskId,
                       @Param("nodeId") String nodeId, @Param("now") Instant now);
 
+    /**
+     * Cooperative yield (D33) — the owner hands unfinished work back while its
+     * lease is still valid. Parks the row in {@code YIELDED} (its own status, so
+     * the next claim knows not to bill it) reserved to the same node,
+     * drops the lease, and clears the backoff gate: no retry budget is consumed
+     * and nothing gates re-claim, so it is immediately claimable again once
+     * whatever caused the yield clears. Fenced by {@code node_id} like every
+     * other release.
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE TmInFlightEntity f SET f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.YIELDED, "
+            + "f.leaseExpiresAt = null, f.nextRetryAt = null, f.updatedAt = :now "
+            + "WHERE f.taskType = :taskType AND f.taskId = :taskId AND f.nodeId = :nodeId "
+            + "AND f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.CLAIMED")
+    int markYielded(@Param("taskType") String taskType, @Param("taskId") String taskId,
+                     @Param("nodeId") String nodeId, @Param("now") Instant now);
+
     /** Terminal release (COMPLETED/FAILED, including exhaustion) — fenced delete; the hot row's job is done. */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("DELETE FROM TmInFlightEntity f WHERE f.taskType = :taskType AND f.taskId = :taskId "
@@ -113,10 +143,14 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
     @Query("DELETE FROM TmInFlightEntity f WHERE f.taskType = :taskType AND f.taskId = :taskId")
     void deleteByTaskTypeAndTaskId(@Param("taskType") String taskType, @Param("taskId") String taskId);
 
-    /** Operator rerun — unconditionally resets to unclaimed (and clears retry progress) regardless of current state. */
+    /**
+     * Operator rerun — unconditionally resets to unclaimed regardless of current
+     * state, opening a new outer attempt with a full fresh retry budget (D33).
+     */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmInFlightEntity f SET f.status = null, f.nodeId = null, f.claimedAt = null, "
-            + "f.leaseExpiresAt = null, f.attemptCount = 0, f.nextRetryAt = null, f.updatedAt = :now "
+            + "f.leaseExpiresAt = null, f.attemptCount = f.attemptCount + 1, f.retryCount = -1, "
+            + "f.nextRetryAt = null, f.updatedAt = :now "
             + "WHERE f.taskType = :taskType AND f.taskId = :taskId")
     int resetForRerun(@Param("taskType") String taskType, @Param("taskId") String taskId, @Param("now") Instant now);
 

@@ -36,7 +36,8 @@ import java.time.Instant;
  * {@code COMPLETED}/{@code FAILED} live exclusively on {@link TmTaskEntity}.
  *
  * <p>This table is the <b>sole</b> source of truth for query/claim/release —
- * the retry counters ({@code attempt_count}/{@code max_attempts}) and the
+ * the nested execution counters ({@code attempt_count}/{@code retry_count},
+ * bounded by {@code max_retries}) and the
  * backoff gate ({@code next_retry_at}) live here too, so those operations
  * never read {@link TmTaskEntity} (which is written only at enqueue and, as a
  * cold snapshot, on the terminal transition).
@@ -70,13 +71,33 @@ public class TmInFlightEntity {
     @Column(name = "node_id")
     private String nodeId;
 
-    /** Live retry counter (moved off {@link TmTaskEntity} — release reads/increments it here). */
+    /**
+     * Outer counter (D33) — the current attempt's own 1-based number. Only an
+     * operator {@code rerun} moves it; automatic retry never does.
+     */
     @Column(name = "attempt_count", nullable = false)
     private int attemptCount;
 
-    /** Per-task retry ceiling; the wired {@code RetryPolicy} is the effective gate (min of the two). */
-    @Column(name = "max_attempts", nullable = false)
-    private int maxAttempts;
+    /**
+     * Inner counter (D33) — the current execution's 0-based ordinal within this
+     * attempt. Spent by {@code claim}: every claim bumps it by one <b>except</b>
+     * a claim of a {@link TaskStatus#YIELDED} row, which is resuming work
+     * rather than starting an execution. Billing at claim rather than release
+     * is what makes a lost lease cost budget at all — the node that lost it
+     * can never write anything.
+     *
+     * <p>Starts at <b>-1</b>, not 0: a row that has never been claimed has no
+     * current execution, and the first claim's {@code +1} lands it on 0, so
+     * the value always reads as "the ordinal of the execution running now"
+     * with no special case for the first one. Reset to -1 whenever
+     * {@code attempt_count} increments.
+     */
+    @Column(name = "retry_count", nullable = false)
+    private int retryCount;
+
+    /** Per-attempt retry ceiling; the wired {@code RetryPolicy} is the effective gate (min of the two). */
+    @Column(name = "max_retries", nullable = false)
+    private int maxRetries;
 
     /** Backoff gate for a requeued row — discovery skips it until this passes. {@code null} = immediately eligible. */
     @Column(name = "next_retry_at")

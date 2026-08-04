@@ -11,6 +11,14 @@ public enum TaskStatus {
     QUEUED,
     CLAIMED,
     RELEASED,
+    /**
+     * Handed back voluntarily by an owner that still held its lease (D33) —
+     * cooperative pause/shutdown. Distinct from {@code QUEUED} because
+     * {@code claim} must be able to tell "this task is resuming work it gave
+     * back" from "this task is starting an execution": every claim spends one
+     * unit of retry budget <b>except</b> a claim of this status.
+     */
+    YIELDED,
     COMPLETED,
     FAILED
 }

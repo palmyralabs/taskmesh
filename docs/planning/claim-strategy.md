@@ -29,7 +29,7 @@ enum RenewOutcome   { RENEWED, LOST }
 enum ReleaseOutcome { OK, LOST_OWNERSHIP }
 
 record ReleaseRequest(
-    TerminalDisposition disposition,   // COMPLETED | REQUEUE | FAILED_TERMINAL
+    TerminalDisposition disposition,   // COMPLETED | RETRY | YIELD | FAILED_TERMINAL  (D33)
     String reasonCode,                 // from FailureClassifier; null on COMPLETED
     String errorSummary                // null on COMPLETED
 )

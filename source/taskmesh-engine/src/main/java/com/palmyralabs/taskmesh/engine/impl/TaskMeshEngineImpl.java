@@ -1,9 +1,11 @@
 package com.palmyralabs.taskmesh.engine.impl;
 
+import com.palmyralabs.taskmesh.api.AttemptCounters;
 import com.palmyralabs.taskmesh.api.ActorType;
 import com.palmyralabs.taskmesh.api.AuditEvent;
 import com.palmyralabs.taskmesh.api.AuditEventSink;
 import com.palmyralabs.taskmesh.api.BacklogPromoter;
+import com.palmyralabs.taskmesh.api.DuplicateEnqueueException;
 import com.palmyralabs.taskmesh.api.ClaimOutcome;
 import com.palmyralabs.taskmesh.api.ClaimStrategy;
 import com.palmyralabs.taskmesh.api.Classification;
@@ -25,6 +27,9 @@ import com.palmyralabs.taskmesh.api.ReleaseRequest;
 import com.palmyralabs.taskmesh.api.TaskLedger;
 import com.palmyralabs.taskmesh.api.TaskProcessor;
 import com.palmyralabs.taskmesh.api.TaskRef;
+import com.palmyralabs.taskmesh.api.TransactionRunner;
+import com.palmyralabs.taskmesh.api.TerminalOutcome;
+import com.palmyralabs.taskmesh.api.TerminalDisposition;
 import com.palmyralabs.taskmesh.api.TimeoutPolicy;
 import com.palmyralabs.taskmesh.engine.TaskMeshEngine;
 
@@ -76,6 +81,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     private final TimeoutPolicy timeoutPolicy;
     private final PayloadProviderFactory payloadProviderFactory;
     private final SchedulingConfig schedulingConfig;
+    private final TransactionRunner transactionRunner;
 
     private final FifoPriorityQueueImpl executionQueue;
     private final ThreadPoolExecutor workerPool;
@@ -103,7 +109,8 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
                                PauseController pauseController,
                                HistoryWriter historyWriter, AuditEventSink auditEventSink, IncidentStore incidentStore,
                                MetricsReporter metricsReporter, TimeoutPolicy timeoutPolicy,
-                               PayloadProviderFactory payloadProviderFactory, SchedulingConfig schedulingConfig) {
+                               PayloadProviderFactory payloadProviderFactory, SchedulingConfig schedulingConfig,
+                               TransactionRunner transactionRunner) {
         this.nodeInfoProvider = nodeInfoProvider;
         this.processorRegistry = processorRegistry;
         this.taskTypes = taskTypes;
@@ -120,6 +127,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         this.timeoutPolicy = timeoutPolicy;
         this.payloadProviderFactory = payloadProviderFactory;
         this.schedulingConfig = schedulingConfig;
+        this.transactionRunner = transactionRunner;
 
         int regularCapacity = Math.max(1, schedulingConfig.getQueueCapacity() - SchedulingConfig.PRIORITY_QUEUE_CAPACITY);
         this.executionQueue = new FifoPriorityQueueImpl(SchedulingConfig.PRIORITY_QUEUE_CAPACITY, regularCapacity);
@@ -248,8 +256,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
      */
     @Override
     public void enqueue(TaskRef taskRef) {
-        taskLedger.enqueue(taskRef);
-        backlogPromoter.onEnqueue(taskRef, nodeInfoProvider.nodeId());
+        persist(taskRef);
         if (executionQueue.isRegularHalfFull()) {
             return;
         }
@@ -272,12 +279,11 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
      */
     @Override
     public void execute(TaskRef taskRef) {
-        taskLedger.enqueue(taskRef);
         // Same hook as enqueue() — note a throttling BacklogPromoter that defers
         // hot-row creation here also defers priority-path claimability, since
         // claim() operates on tm_in_flight; that tradeoff belongs to the
         // BacklogPromoter implementation, not this call site.
-        backlogPromoter.onEnqueue(taskRef, nodeInfoProvider.nodeId());
+        persist(taskRef);
         if (!inFlightSet.add(taskRef)) {
             return;
         }
@@ -339,22 +345,46 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         };
     }
 
+    /** Reason code for a task terminated at claim time because its budget was already spent (D33). */
+    private static final String RETRY_BUDGET_EXHAUSTED = "RETRY_BUDGET_EXHAUSTED";
+
     private void attempt(TaskRef taskRef) {
         // Paused: do not claim new work — leave it QUEUED for pickup on resume. This also
         // covers the enqueue()/execute() fast-path, which reaches here without the poller.
         if (pauseController.isPauseRequested()) {
             return;
         }
-        // Phase 2 — Claim
-        ClaimOutcome claimOutcome = claimStrategy.claim(taskRef);
+        // Phase 2 — Claim. ClaimStrategy opens no transaction of its own; the boundary is ours,
+        // which is what lets a claim that turns out to be terminal (D33's exhausted-at-claim path)
+        // commit its terminal write and the consumer's onTerminal together.
+        ClaimOutcome claimOutcome = claimAndNotify(taskRef);
         if (claimOutcome == ClaimOutcome.LOST) {
             return; // silent, normal — not logged above debug, per runtime-flow.md
         }
+        // Read fresh off the row right after claim, rather than an engine-local counter — that
+        // wouldn't survive a JVM restart or agree across nodes. Already the current execution's
+        // own (attempt_count, retry_count) — no further +1. See TaskLedger#counters.
+        AttemptCounters counters = taskLedger.counters(taskRef);
+
+        if (claimOutcome == ClaimOutcome.EXHAUSTED) {
+            // D33: retry budget is spent at claim time, so a task whose previous execution died
+            // without ever releasing is terminated here rather than reclaimed forever. The ledger
+            // has already written the cold FAILED snapshot and deleted the hot row — there is no
+            // claim left to release — so all that remains is the same bookkeeping a release-side
+            // exhaustion does (D19 symmetry). Never silent: this is exactly the failure that used
+            // to disappear.
+            log.warn("Task {} terminated at claim: retry budget exhausted with no reported outcome "
+                    + "(attempt {}, retry {}) — the previous execution's node died or lost its lease",
+                    taskRef, counters.attemptCount(), counters.retryCount());
+            incidentStore.open(new Incident(taskRef, RETRY_BUDGET_EXHAUSTED,
+                    "Retry budget exhausted with no reported outcome — the previous execution's node "
+                            + "lost its lease or died without releasing", Instant.now()));
+            recordHistory(new HistoryEvent(taskRef, counters.attemptCount(), counters.retryCount(),
+                    HistoryEventType.FAILED, RETRY_BUDGET_EXHAUSTED, Instant.now(), nodeInfoProvider.nodeId()));
+            metricsReporter.taskFailed(taskRef.taskType(), RETRY_BUDGET_EXHAUSTED);
+            return;
+        }
         metricsReporter.taskClaimed(taskRef.taskType());
-        // Read fresh off the hot row right after claim, rather than an engine-local counter —
-        // that wouldn't survive a JVM restart or agree across nodes. Already the current attempt's
-        // own number (set at row creation, bumped on each requeue) — no further +1. See TaskLedger#attemptCount.
-        int attemptNumber = taskLedger.attemptCount(taskRef);
 
         // Phase 3 — Pre-dispatch
         if (!processorRegistry.isRegistered(taskRef.taskType())) {
@@ -362,7 +392,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
             incidentStore.open(new Incident(taskRef, "NO_PROCESSOR",
                     "No TaskProcessor registered for task type '" + taskRef.taskType() + "'", Instant.now()));
             claimStrategy.release(taskRef, ReleaseRequest.failedTerminal("NO_PROCESSOR", "No TaskProcessor registered"));
-            historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.FAILED, "NO_PROCESSOR", Instant.now(), nodeInfoProvider.nodeId()));
+            recordHistory(new HistoryEvent(taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.FAILED, "NO_PROCESSOR", Instant.now(), nodeInfoProvider.nodeId()));
             return;
         }
         TaskProcessor processor = processorRegistry.lookup(taskRef.taskType());
@@ -370,18 +400,28 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
         Duration timeout = timeoutPolicy.timeoutFor(taskRef.taskType());
         Instant deadline = Instant.now().plus(timeout);
-        DefaultTaskContext ctx = new DefaultTaskContext(taskRef, attemptNumber, payloadProvider, heartbeatStrategy, pauseController,
-                () -> shutdownRequested);
-        historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.STARTED, null, Instant.now(), nodeInfoProvider.nodeId()));
+        DefaultTaskContext ctx = new DefaultTaskContext(taskRef, counters, payloadProvider, heartbeatStrategy, pauseController,
+                () -> shutdownRequested, transactionRunner);
+        recordHistory(new HistoryEvent(taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.STARTED, null, Instant.now(), nodeInfoProvider.nodeId()));
 
         // Phase 4 — Execution
         Instant startedAt = Instant.now();
         try {
+            // Its own short transaction, before any work is done. A consumer projection learns
+            // here that the task is alive — including that an operator re-ran it, which nothing
+            // else in the engine would tell it (see TaskProcessor#onStart). A throw travels the
+            // ordinary classified-failure path below, so a broken hook is retried and bounded
+            // rather than silently skipped.
+            transactionRunner.call(() -> {
+                processor.onStart(ctx);
+                return null;
+            });
+
             processor.process(ctx);
 
             if (!ctx.isOwnershipValid()) {
                 // Phase 6 — lost ownership mid-execution: no release, audit-only history.
-                historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.OWNERSHIP_LOST, null, Instant.now(), nodeInfoProvider.nodeId()));
+                recordHistory(new HistoryEvent(taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.OWNERSHIP_LOST, null, Instant.now(), nodeInfoProvider.nodeId()));
                 return;
             }
             if (Instant.now().isAfter(deadline)) {
@@ -391,48 +431,185 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
             }
 
             // Phase 5a — Success
-            claimStrategy.release(taskRef, ReleaseRequest.completed());
-            historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.COMPLETED, null, Instant.now(), nodeInfoProvider.nodeId()));
+            releaseAndNotify(taskRef, ReleaseRequest.completed(), counters, processor, ctx);
+            recordHistory(new HistoryEvent(taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.COMPLETED, null, Instant.now(), nodeInfoProvider.nodeId()));
             metricsReporter.taskCompleted(taskRef.taskType(), Duration.between(startedAt, Instant.now()));
         } catch (Exception failure) {
             if (!ctx.isOwnershipValid()) {
-                historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.OWNERSHIP_LOST,
+                recordHistory(new HistoryEvent(taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.OWNERSHIP_LOST,
                         summarize(failure), Instant.now(), nodeInfoProvider.nodeId()));
                 return;
             }
-            handleFailure(taskRef, attemptNumber, failure);
+            handleFailure(taskRef, counters, failure, processor, ctx);
+        } catch (Error error) {
+            // An Error (OOM, AssertionError, NoClassDefFoundError, ...) is a JVM/environment-level
+            // failure, not classifiable task data — never routed through FailureClassifier (its
+            // contract is Exception only) and never burns a retry attempt against a bug that will
+            // just re-throw identically. Released immediately as terminal/incident-worthy, matching
+            // how NO_PROCESSOR is handled, rather than silently stranding the claim forever (the gap
+            // this whole catch clause exists to close — see TaskMeshEngineFailureModesTest).
+            if (!ctx.isOwnershipValid()) {
+                recordHistory(new HistoryEvent(taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.OWNERSHIP_LOST,
+                        summarize(error), Instant.now(), nodeInfoProvider.nodeId()));
+                throw error;
+            }
+            incidentStore.open(new Incident(taskRef, "PROCESSOR_ERROR", summarize(error), Instant.now()));
+            releaseAndNotify(taskRef, ReleaseRequest.failedTerminal("PROCESSOR_ERROR", summarize(error)),
+                    counters, processor, ctx);
+            recordHistory(new HistoryEvent(taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.FAILED, "PROCESSOR_ERROR",
+                    Instant.now(), nodeInfoProvider.nodeId()));
+            metricsReporter.taskFailed(taskRef.taskType(), "PROCESSOR_ERROR");
+            throw error; // cleanup done — don't swallow it; let it still surface via the worker thread's own error path
+        }
+    }
+
+    /**
+     * The one place a release happens, so the one place terminality is noticed. Both the ledger's
+     * write and the consumer's {@link TaskProcessor#onTerminal} run inside a single transaction
+     * boundary opened here: the ledger's own transaction joins this one rather than committing
+     * separately, so a consumer projection and the queue's terminal state cannot diverge, and a
+     * throwing callback takes the terminal transition down with it. Keeping the boundary here
+     * rather than pushing a callback down into every {@code ClaimStrategy} leaves that interface —
+     * a public extension seam — untouched, and the ledgers with nothing to know about consumers.
+     *
+     * <p>Deliberately <b>not</b> wrapped in a try/catch, unlike {@link #recordHistory}: history is
+     * audit-only and must never affect control flow, whereas vetoing a terminal transition is
+     * exactly what {@link TaskProcessor#onTerminal} is documented to be able to do.
+     *
+     * <p>The payload is whatever the execution already loaded, never a fresh fetch — a terminal
+     * reached with no execution behind it has none, and {@code TypedTaskProcessor} passes null
+     * through rather than rejecting it.
+     */
+    /**
+     * The durable half of {@code enqueue}/{@code execute}: the cold/hot pair, written in **one**
+     * transaction. The two steps are always called together — the ledger writes what it owns and
+     * the {@link BacklogPromoter} decides when the hot row appears — so giving them one boundary
+     * halves the commit count on the enqueue path, and matters most at the tier where the ledger
+     * writes only the cold row and the promoter always writes the hot one immediately.
+     *
+     * <p>A lost enqueue race arrives as {@link DuplicateEnqueueException} rather than being
+     * swallowed inside the ledger, because a swallow only works while the failed insert is
+     * isolated: inside this boundary the violation has already marked the transaction
+     * rollback-only. Losing it still isn't an error — {@code enqueue} is idempotent and the
+     * winner's rows are exactly what this call wanted — so it is reported as success.
+     */
+    private void persist(TaskRef taskRef) {
+        try {
+            transactionRunner.call(() -> {
+                taskLedger.enqueue(taskRef);
+                backlogPromoter.onEnqueue(taskRef, nodeInfoProvider.nodeId());
+                return null;
+            });
+        } catch (DuplicateEnqueueException e) {
+            log.debug("Concurrent enqueue of {} lost the race; the other caller's rows stand", taskRef);
+        }
+    }
+
+    /**
+     * The claim-time twin of {@link #releaseAndNotify}. D33 lets a claim terminate a task rather
+     * than admit it — the case {@code release()} structurally cannot see, since the node whose
+     * execution died never reaches a release — so that transition needs the same boundary and the
+     * same notification as any other terminal one.
+     */
+    private ClaimOutcome claimAndNotify(TaskRef taskRef) {
+        TaskProcessor processor = processorRegistry.isRegistered(taskRef.taskType())
+                ? processorRegistry.lookup(taskRef.taskType()) : null;
+        return transactionRunner.call(() -> {
+            ClaimOutcome outcome = claimStrategy.claim(taskRef);
+            if (outcome == ClaimOutcome.EXHAUSTED && processor != null) {
+                // Read before the terminal write's row deletion is visible to us, and with no
+                // payload: no execution ran, so none was ever loaded. TypedTaskProcessor passes
+                // that null through rather than rejecting it.
+                processor.onTerminal(new DefaultTerminalContext(taskRef, taskLedger.counters(taskRef), null,
+                        TerminalOutcome.FAILED_EXHAUSTED, RETRY_BUDGET_EXHAUSTED,
+                        "Retry budget exhausted with no reported outcome — the previous execution's "
+                                + "node lost its lease or died without releasing",
+                        nodeInfoProvider.nodeId(), Instant.now()));
+            }
+            return outcome;
+        });
+    }
+
+    private ReleaseOutcome releaseAndNotify(TaskRef taskRef, ReleaseRequest request, AttemptCounters counters,
+                                             TaskProcessor processor, DefaultTaskContext ctx) {
+        return transactionRunner.call(() -> {
+            ReleaseOutcome outcome = claimStrategy.release(taskRef, request);
+            TerminalOutcome terminal = terminalOutcomeOf(request.disposition(), outcome);
+            if (terminal != null && processor != null) {
+                processor.onTerminal(new DefaultTerminalContext(taskRef, counters,
+                        ctx == null ? null : ctx.payloadIfLoaded(), terminal,
+                        request.reasonCode(), request.errorSummary(),
+                        nodeInfoProvider.nodeId(), Instant.now()));
+            }
+            return outcome;
+        });
+    }
+
+    /**
+     * Which terminal outcome this release produced, or {@code null} if it produced none. A
+     * within-budget {@code RETRY} and a {@code YIELD} are not terminal; neither is anything that
+     * lost ownership, since that node wrote nothing at all.
+     */
+    private static TerminalOutcome terminalOutcomeOf(TerminalDisposition disposition, ReleaseOutcome outcome) {
+        if (outcome == ReleaseOutcome.LOST_OWNERSHIP) {
+            return null;
+        }
+        if (outcome == ReleaseOutcome.EXHAUSTED) {
+            return TerminalOutcome.FAILED_EXHAUSTED;   // a RETRY the ledger escalated (D19)
+        }
+        return switch (disposition) {
+            case COMPLETED -> TerminalOutcome.COMPLETED;
+            case FAILED_TERMINAL -> TerminalOutcome.FAILED_NONRETRYABLE;
+            case RETRY, YIELD -> null;
+        };
+    }
+
+    /**
+     * Every {@code historyWriter.record(...)} call in this class goes through here rather than
+     * calling {@code historyWriter} directly. {@link HistoryWriter} is documented as audit-only
+     * ("must never affect control flow") but nothing previously enforced that on the write side —
+     * a failing write (e.g. the STARTED write, which used to run before process() even started)
+     * could leak a claim or abort a release that had already succeeded. Logged loudly (silence is
+     * a bug) but never rethrown.
+     */
+    private void recordHistory(HistoryEvent event) {
+        try {
+            historyWriter.record(event);
+        } catch (Exception e) {
+            log.error("HistoryWriter failed to record {} for {}", event.type(), event.taskRef(), e);
         }
     }
 
     /** Phase 5b/5c — retryable or terminal failure. */
-    private void handleFailure(TaskRef taskRef, int attemptNumber, Exception failure) {
+    private void handleFailure(TaskRef taskRef, AttemptCounters counters, Exception failure,
+                                TaskProcessor processor, DefaultTaskContext ctx) {
         Classification classification = failureClassifier.classify(failure);
         ReleaseRequest request = classification.retryable()
-                ? ReleaseRequest.requeue(classification.reasonCode(), summarize(failure))
+                ? ReleaseRequest.retry(classification.reasonCode(), summarize(failure))
                 : ReleaseRequest.failedTerminal(classification.reasonCode(), summarize(failure));
 
-        ReleaseOutcome outcome = claimStrategy.release(taskRef, request);
+        ReleaseOutcome outcome = releaseAndNotify(taskRef, request, counters, processor, ctx);
 
         switch (outcome) {
-            case LOST_OWNERSHIP -> historyWriter.record(new HistoryEvent(
-                    taskRef, attemptNumber, HistoryEventType.OWNERSHIP_LOST, summarize(failure), Instant.now(), nodeInfoProvider.nodeId()));
+            case LOST_OWNERSHIP -> recordHistory(new HistoryEvent(
+                    taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.OWNERSHIP_LOST, summarize(failure), Instant.now(), nodeInfoProvider.nodeId()));
             case OK -> {
                 if (classification.retryable()) {
-                    historyWriter.record(new HistoryEvent(
-                            taskRef, attemptNumber, HistoryEventType.RETRIED, classification.reasonCode(), Instant.now(), nodeInfoProvider.nodeId()));
+                    recordHistory(new HistoryEvent(
+                            taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.RETRIED, classification.reasonCode(), Instant.now(), nodeInfoProvider.nodeId()));
                     metricsReporter.taskRetried(taskRef.taskType(), classification.reasonCode());
                 } else {
-                    openTerminalIncident(taskRef, attemptNumber, classification, failure);
+                    openTerminalIncident(taskRef, counters, classification, failure);
                 }
             }
-            case EXHAUSTED -> openTerminalIncident(taskRef, attemptNumber, classification, failure);
+            case EXHAUSTED -> openTerminalIncident(taskRef, counters, classification, failure);
         }
     }
 
-    private void openTerminalIncident(TaskRef taskRef, int attemptNumber, Classification classification, Exception failure) {
+    private void openTerminalIncident(TaskRef taskRef, AttemptCounters counters, Classification classification, Exception failure) {
         String reasonCode = classification.reasonCode();
         incidentStore.open(new Incident(taskRef, reasonCode, summarize(failure), Instant.now()));
-        historyWriter.record(new HistoryEvent(taskRef, attemptNumber, HistoryEventType.FAILED, reasonCode, Instant.now(), nodeInfoProvider.nodeId()));
+        recordHistory(new HistoryEvent(taskRef, counters.attemptCount(), counters.retryCount(), HistoryEventType.FAILED, reasonCode, Instant.now(), nodeInfoProvider.nodeId()));
         metricsReporter.taskFailed(taskRef.taskType(), reasonCode);
     }
 

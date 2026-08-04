@@ -33,6 +33,10 @@ import static org.junit.jupiter.api.Assertions.fail;
 /**
  * Two real engines (node-1 / node-2) sharing one H2 database — exercises actual
  * cross-node claim arbitration, reservation stealing, and no-loss delivery.
+ *
+ * <p>Not tagged {@code stress} despite the 90s {@code await} timeouts in this
+ * class — those are polling ceilings, not real sleeps; measured wall time is
+ * ~20s, in line with an ordinary JPA test module's Spring Boot context startup.
  */
 @SpringBootTest(classes = MultiNodeTestApp.class, properties = {
         "spring.datasource.url=jdbc:h2:mem:mndb;DB_CLOSE_DELAY=-1",

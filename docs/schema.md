@@ -50,7 +50,8 @@ auto-create/update) — see `dbscripts/edms_mig/007_tm_task.sql` through
 
 > **The hot `tm_in_flight` row is the sole source of truth for query/claim/release.**
 > All the state those operations need — `status` (including the `QUEUED`
-> reservation), `node_id`, the retry counters (`attempt_count`/`max_attempts`)
+> reservation), `node_id`, the nested counters (`attempt_count`/`retry_count`,
+> bounded by `max_retries`)
 > and the backoff gate (`next_retry_at`) — lives on the hot row. `tm_task` is
 > written only at enqueue and, as a cold snapshot, on the terminal transition;
 > query/claim/release never read it. This is a deliberate tightening of D28:
@@ -92,7 +93,7 @@ Postgres-specific tuning).
 |---------------------|-----------------------------------------------------------------------------------------|
 | `task_type`, `task_id` (PK) | Task identity. `task_type` is a runtime string key (e.g. `"POLICY_MIGRATE"`); `task_id` is opaque to taskmesh — the consuming app decides its format (e.g. `branchCode:policyNumber`). |
 | `status`            | `QUEUED` (at enqueue), then `COMPLETED` or `FAILED` at the terminal transition. Never read by claim/discovery. |
-| `attempt_count` / `max_attempts` | **Terminal snapshot** — copied from the hot row on the terminal transition (the live counters live on `tm_in_flight` now). `0`/placeholder until then. |
+| `attempt_count` / `retry_count` / `max_retries` | **Terminal snapshot** — the hot row's counters (see below) copied verbatim on the terminal transition, unchanged. `0`/placeholder until then. Both counters are here deliberately: without `retry_count`, "how many retries did this burn before it failed" is unanswerable once the hot row is deleted, which is one of the signals the D33 split exists to expose. |
 | `reason_code`, `error_summary` | Set on the terminal transition (`COMPLETED` clears them; `FAILED` records why). |
 | `created_at`, `updated_at` | Standard audit timestamps. |
 
@@ -125,9 +126,10 @@ path may instead insert an unreserved `status = NULL` row directly.
 | Column             | Notes                                                                                  |
 |---------------------|-----------------------------------------------------------------------------------------|
 | `task_type`, `task_id` (PK) | Same identity as the paired `tm_task` row. |
-| `status`            | `QUEUED` (freshly enqueued, reserved to `node_id`), `NULL` (unreserved, bulk/external), `CLAIMED`, or `RELEASED`. |
+| `status`            | `QUEUED` (freshly enqueued, reserved to `node_id`), `NULL` (unreserved, bulk/external), `CLAIMED`, `RELEASED`, or `YIELDED` (handed back voluntarily — its own status so `claim` knows not to spend budget on it, D33). |
 | `node_id`           | For `QUEUED`, the enqueuing (reserving) node. For `CLAIMED`/`RELEASED`, the current/last owner. **Not cleared** on a `MultiNodeTaskLedger` retryable release — kept as "last owner" so the affinity window has something to key on. `SimpleTaskLedger` clears it on release (no affinity concept). |
-| `attempt_count` / `max_attempts` | Live retry bookkeeping (moved off `tm_task`). Exhaustion (`attempt_count + 1 > min(max_attempts, RetryPolicy.maxAttempts)`) is decided here inside the release, then the final values are copied onto the `tm_task` snapshot. |
+| `attempt_count` | **Outer** counter (D33), 1-based. An *attempt* is one operator-initiated run: 1 for a freshly enqueued task (set to `tm_task.attempt_count + 1` when the row is created, at enqueue/rerun/promote), incremented only by `rerun`. **Unbounded** — there is no maximum for a manual action, which is why `max_attempts` was removed rather than renamed. Automatic retry never touches it. |
+| `retry_count` / `max_retries` | **Inner** counter (D33), 0-based: the ordinal of the execution running *right now* within this attempt. **Spent by `claim`** — every claim bills `+1` except one resuming a `YIELDED` row — and **reset to `-1` whenever `attempt_count` increments**, so a re-run gets a full fresh budget and that attempt's first claim lands it on `0`. Billing at claim rather than release is what makes a lost lease cost anything: the node that lost it is unfenced by construction and can never write. `max_retries = N` admits ordinals `0..N`, i.e. N+1 executions per attempt — the same total the old `attempt_count > max_attempts` check gave. |
 | `next_retry_at`     | Backoff gate — **discovery** skips the row until this passes (`NULL` = immediately eligible). Set on a retryable release. Claim itself does not gate on it (discovery already filtered). |
 | `claimed_at`        | When the current claim started. Only bumped forward on a genuine re-claim (new owner, or the same owner reclaiming after the short write-minimization window) — see the window model below. |
 | `lease_expires_at`  | Multi-node only. `HeartbeatStrategy` renews this periodically while a worker holds the task; if it lapses, another node's claim query treats the row as abandoned (the "claim timeout" window). |
@@ -169,16 +171,65 @@ the eligibility block above, or discovery and claim drift apart.
 
 **Release**, split by outcome:
 - **Terminal** (`COMPLETED`/`FAILED`) — the hot row's final `attempt_count`/
-  `max_attempts` are read, then the hot row is deleted, fenced on `node_id` +
+  `retry_count`/`max_retries` are read, then the hot row is deleted, fenced on `node_id` +
   `status='CLAIMED'` (0 rows deleted means ownership was already lost, and
   `tm_task` is never touched); only then is `tm_task` updated by PK, copying
   those counters plus the terminal status/reason as the cold snapshot.
-- **Requeue** (retryable) — touches only the hot row: `MultiNodeTaskLedger`
-  fences it to `RELEASED` (node_id retained), increments `attempt_count` and
-  sets `next_retry_at`. On exhaustion it instead snapshots the final counters
-  to `tm_task` (status `FAILED`) and deletes the hot row.
-  `SimpleTaskLedger` resets the hot row straight to unclaimed (node cleared)
-  rather than `RELEASED`, but otherwise increments/gates the same way.
+- **Retry** (retryable failure) — touches only the hot row: `MultiNodeTaskLedger`
+  fences it to `RELEASED` (node_id retained) and sets `next_retry_at` from the
+  ordinal `claim` is about to move the counter to. Neither counter is written
+  here — billing is `claim`'s job (D33). On exhaustion it
+  instead snapshots the final counters to `tm_task` (status `FAILED`) and
+  deletes the hot row. `SimpleTaskLedger` resets the hot row straight to
+  unclaimed (node cleared) rather than `RELEASED`, but otherwise
+  increments/gates the same way.
+- **Yield** (cooperative hand-back, D33) — the owner still holds the lease and
+  voluntarily returns unfinished work (pause/shutdown). Fenced the same way,
+  but consumes **no** retry budget and sets **no** backoff gate: the row is
+  parked in `YIELDED` (reserved to the same node) with `next_retry_at`
+  cleared, so it is immediately claimable again once whatever caused the yield
+  clears. The distinct status is load-bearing rather than cosmetic — it is how
+  the next `claim` knows this is the same execution resuming and must not be
+  billed. A pause/resume loop therefore cannot bankrupt a task.
+
+**Budget is spent at claim, and exhaustion is enforced there too** (D33).
+A node that loses its lease cannot record anything — its release is unfenced
+and returns `LOST_OWNERSHIP` — so if `release()` were the only place that
+billed and the only place that terminated, a task that systematically cannot
+finish within one lease would be reclaimed forever, never reaching a terminal
+state and never appearing as a failure. Instead:
+
+- `claimMultiNode`'s UPDATE carries
+  `retry_count = retry_count + CASE WHEN status = 'YIELDED' THEN 0 ELSE 1 END`,
+  atomic with the claim, no sweeper (which D27's visibility-based recovery
+  deliberately avoids).
+- Immediately after winning, the ledger compares the freshly billed ordinal
+  against `min(max_retries, RetryPolicy.maxRetries)`. Over budget means the
+  execution is **not** admitted: the cold row is snapshotted `FAILED` with
+  `reason_code = RETRY_BUDGET_EXHAUSTED`, the hot row is deleted, and
+  `ClaimOutcome.EXHAUSTED` is returned so the engine opens an incident and
+  records the failure. The snapshot stores the last ordinal that actually ran
+  — the increment that tipped the budget over belongs to an execution that
+  never happens.
+
+The check deliberately runs *after* the claim UPDATE rather than as another
+condition inside it: the eligibility block stays byte-identical to
+`findClaimableMultiNode`'s, and the terminal write is fenced by ownership the
+claim just acquired, so no other node can be running the task while it
+happens. That write joins the **caller's** transaction (D34) — the engine's, so
+that the terminal write and the consumer's `onTerminal` commit as one unit. It
+takes `tm_in_flight` first (from the claim UPDATE) then `tm_task`, and **every
+other write path does the same** — claim, release, rerun and enqueue all touch
+the hot row before the cold one. That single order is forced by this path: it
+already holds the hot row before it can know the task is terminal, so it can
+never take the cold one first, and anything that did would deadlock against it.
+`release` used to take `tm_task` first (a `lockByPk` that is now gone) and a
+Postgres torture run deadlocked 40 times out of 40 — see D34.
+
+`release()` keeps its own exhaustion check for the ordinary path — a node that
+survives and reports its failure — deciding one step early that no next
+execution exists rather than letting it be claimed only to be terminated then.
+Neither path increments twice: **only `claim` moves the counter.**
 
 `SimpleTaskLedger` (single-node) skips the lease/affinity/claim-timeout/
 reservation machinery entirely — `claimSingleNode` is a plain
@@ -197,7 +248,7 @@ is the table to query for "what happened to task X" over its full history.
 |---|---|
 | `id` (PK) | Surrogate, `BIGSERIAL`/`IDENTITY`. |
 | `task_type`, `task_id` | Which task. |
-| `attempt_number` | Which attempt this event belongs to (starts at 1). |
+| `attempt_count` / `retry_count` | Which execution this event belongs to — the D33 pair, read as "(attempt 2, retry 3) is the third retry of the second attempt". |
 | `event_type` | `STARTED`, `COMPLETED`, `FAILED`, `RETRIED`, `OWNERSHIP_LOST`, `PAUSED`, `HEARTBEAT`. |
 | `detail` | Free-text detail (`LONGVARCHAR`, not `@Lob` — see Postgres note above). |
 | `occurred_at` | When the event happened. |
@@ -239,7 +290,7 @@ partition key either).
 ## `tm_incident`
 
 Terminally-failed tasks that need a human to look at them — written by
-`JpaIncidentStore` once a task exhausts `max_attempts` (or hits a
+`JpaIncidentStore` once a task exhausts `max_retries` (or hits a
 non-retryable failure). This is the operational worklist: "what's broken and
 needs attention," separate from `tm_task`'s `status='FAILED'` rows (which are
 the raw state, not a triaged queue).
@@ -263,13 +314,13 @@ treatment as `tm_history_event` above, same `SEQUENCE`-not-`IDENTITY` reason.
 ## `tm_attempt_history`
 
 BATCH profile's coarse alternative to `tm_history_event` (`AttemptHistoryWriter`)
-— one row per `(task_type, task_id, attempt_number)`, upserted in place
-(`INSERT` on `STARTED`, `UPDATE` on the attempt's terminal outcome) rather
-than append-only.
+— one row per `(task_type, task_id, attempt_count, retry_count)`, upserted in
+place (`INSERT` on `STARTED`, `UPDATE` on the execution's terminal outcome)
+rather than append-only.
 
 | Column | Notes |
 |---|---|
-| `task_type`, `task_id`, `attempt_number` (PK) | One row per attempt — the composite key is load-bearing: `AttemptHistoryWriter` looks up by it to decide insert vs. update. |
+| `task_type`, `task_id`, `attempt_count`, `retry_count` (PK) | One row per execution — the composite key is load-bearing twice over: `AttemptHistoryWriter` looks up by it to decide insert vs. update, and having **both** D33 counters in it is what makes `rerun`'s `retry_count` reset safe — `(1, 3)` and `(2, 0)` are distinct by construction, so a fresh attempt can never overwrite pre-rerun history. |
 | `status` | Last `HistoryEventType` recorded for the attempt. |
 | `started_at`, `ended_at` | `ended_at` set only on a terminal outcome. |
 | `node_id` | The node that recorded the attempt's most recent event — set from `HistoryEvent.nodeId()` on every write (insert and update), so it reflects the current owner, not just who started it. |

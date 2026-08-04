@@ -34,7 +34,8 @@ public class JpaHistoryWriter implements HistoryWriter {
         entity.setTaskType(event.taskRef().taskType());
         entity.setTaskId(event.taskRef().taskId());
         entity.setPartitionKey(event.taskRef().partitionKey());
-        entity.setAttemptNumber(event.attemptNumber());
+        entity.setAttemptCount(event.attemptCount());
+        entity.setRetryCount(event.retryCount());
         entity.setEventType(event.type());
         entity.setDetail(event.detail());
         entity.setOccurredAt(event.occurredAt());

@@ -32,7 +32,7 @@ import java.time.Instant;
  *
  * <p>Query/claim/release never read this table — it is written only at
  * enqueue ({@code QUEUED}) and on the terminal transition, where the final
- * {@code attempt_count}/{@code max_attempts} are <b>copied from the hot
+ * {@code attempt_count}/{@code retry_count}/{@code max_retries} are <b>copied from the hot
  * {@link TmInFlightEntity} row</b> (the live counters live there now) as a
  * durable snapshot before that row is deleted. There is no {@code next_retry_at}
  * here anymore — the backoff gate moved to the hot row with the rest of the
@@ -62,13 +62,22 @@ public class TmTaskEntity {
     @Column(name = "status", nullable = false, length = 32)
     private TaskStatus status;
 
-    /** Final attempt count — snapshotted from the hot row on the terminal transition (0 until then). */
+    /** Final attempt number — snapshotted from the hot row on the terminal transition (0 until then). */
     @Column(name = "attempt_count", nullable = false)
     private int attemptCount;
 
+    /**
+     * Retries burned within that final attempt — snapshotted alongside
+     * {@code attempt_count} (D33). Without it, "how many retries did this burn
+     * before it failed" is unanswerable once the hot row is deleted, which is
+     * one of the signals the counter split exists to expose.
+     */
+    @Column(name = "retry_count", nullable = false)
+    private int retryCount;
+
     /** Snapshotted from the hot row on the terminal transition. */
-    @Column(name = "max_attempts", nullable = false)
-    private int maxAttempts;
+    @Column(name = "max_retries", nullable = false)
+    private int maxRetries;
 
     @Column(name = "reason_code")
     private String reasonCode;

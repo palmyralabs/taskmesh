@@ -33,7 +33,7 @@
 
 -- ---- tm_task (cold ledger) -------------------------------------------
 -- Written only at enqueue (QUEUED) and on the terminal transition, where the
--- final attempt_count/max_attempts are snapshotted from the hot row.
+-- final attempt_count/retry_count/max_retries are snapshotted from the hot row.
 -- This reference script is shared across taskmesh-simple/-pro/-max (D31);
 -- promoted_at/partition_key and partition_key's PK membership are
 -- taskmesh-max ONLY — omit them for taskmesh-simple/-pro.
@@ -41,8 +41,9 @@ CREATE TABLE tm_task (
     task_type       VARCHAR(128) NOT NULL,
     task_id         VARCHAR(255) NOT NULL,
     status          VARCHAR(32)  NOT NULL,          -- QUEUED | COMPLETED | FAILED
-    attempt_count   INTEGER      NOT NULL,
-    max_attempts    INTEGER      NOT NULL,
+    attempt_count   INTEGER      NOT NULL,          -- outer counter (D33): operator attempts, 1-based
+    retry_count     INTEGER      NOT NULL DEFAULT 0,  -- inner counter (D33): retries burned in that attempt
+    max_retries     INTEGER      NOT NULL,
     reason_code     VARCHAR(255),
     error_summary   TEXT,
     created_at      TIMESTAMP(6) WITH TIME ZONE NOT NULL,
@@ -56,16 +57,19 @@ CREATE INDEX idx_tm_task_type_status ON tm_task (task_type, status);
 CREATE INDEX idx_tm_task_unpromoted ON tm_task (created_at) WHERE promoted_at IS NULL AND status = 'QUEUED';
 
 -- ---- tm_in_flight (hot claim state) ----------------------------------
--- Sole source of truth for query/claim/release. Carries the live retry
--- counters and the backoff gate. Deleted at a terminal outcome.
+-- Sole source of truth for query/claim/release. Carries the live nested
+-- counters (D33) and the backoff gate. Deleted at a terminal outcome.
 CREATE TABLE tm_in_flight (
     task_type        VARCHAR(128) NOT NULL,
     task_id          VARCHAR(255) NOT NULL,
     partition_key    VARCHAR(255) NOT NULL,         -- taskmesh-max only (D32); plain column, NOT part of the PK — this table is never physically partitioned
-    status           VARCHAR(32),                    -- QUEUED (reserved) | NULL (unreserved) | CLAIMED | RELEASED
+    status           VARCHAR(32),                    -- QUEUED (reserved) | NULL (unreserved) | CLAIMED | RELEASED | YIELDED
     node_id          VARCHAR(255),
-    attempt_count    INTEGER      NOT NULL,
-    max_attempts     INTEGER      NOT NULL,
+    attempt_count    INTEGER      NOT NULL,           -- outer (D33): 1-based; only an operator rerun moves it
+    retry_count      INTEGER      NOT NULL DEFAULT -1, -- inner (D33): 0-based ordinal of the execution running now.
+                                                       -- Starts at -1 ("never claimed"); every claim bills +1 except
+                                                       -- one resuming a YIELDED row, so the first claim lands it on 0.
+    max_retries      INTEGER      NOT NULL,            -- bounds retry_count only; attempt_count is unbounded
     next_retry_at    TIMESTAMP(6) WITH TIME ZONE,
     claimed_at       TIMESTAMP(6) WITH TIME ZONE,
     lease_expires_at TIMESTAMP(6) WITH TIME ZONE,
@@ -90,7 +94,8 @@ CREATE TABLE tm_history_event (
     partition_key  VARCHAR(255) NOT NULL,           -- taskmesh-max only (D32); omit for -simple/-pro
     task_type      VARCHAR(128) NOT NULL,
     task_id        VARCHAR(255) NOT NULL,
-    attempt_number INTEGER      NOT NULL,
+    attempt_count  INTEGER      NOT NULL,           -- (attempt_count, retry_count) names the execution (D33)
+    retry_count    INTEGER      NOT NULL,
     event_type     VARCHAR(32)  NOT NULL,           -- STARTED | COMPLETED | FAILED | RETRIED | OWNERSHIP_LOST | PAUSED | HEARTBEAT
     detail         TEXT,
     occurred_at    TIMESTAMP(6) WITH TIME ZONE NOT NULL,
@@ -98,19 +103,23 @@ CREATE TABLE tm_history_event (
 );
 CREATE INDEX idx_tm_history_event_task ON tm_history_event (task_type, task_id);
 
--- ---- tm_attempt_history (BATCH profile — one row per attempt) ---------
+-- ---- tm_attempt_history (BATCH profile — one row per execution) -------
 -- Coarse alternative to tm_history_event, used by AttemptHistoryWriter.
+-- BOTH D33 counters are in the PK: that is what makes rerun's retry_count
+-- reset safe — (1, 3) and (2, 0) are distinct rows by construction, so a
+-- fresh attempt can never overwrite pre-rerun history.
 CREATE TABLE tm_attempt_history (
     task_type      VARCHAR(128) NOT NULL,
     task_id        VARCHAR(255) NOT NULL,
-    attempt_number INTEGER      NOT NULL,
+    attempt_count  INTEGER      NOT NULL,
+    retry_count    INTEGER      NOT NULL,
     partition_key  VARCHAR(255) NOT NULL,           -- taskmesh-max only (D32); omit for -simple/-pro
     status         VARCHAR(32)  NOT NULL,           -- last HistoryEventType for the attempt
     started_at     TIMESTAMP(6) WITH TIME ZONE NOT NULL,
     ended_at       TIMESTAMP(6) WITH TIME ZONE,
     node_id        VARCHAR(255),                     -- node that recorded the attempt's most recent event
     detail         TEXT,
-    CONSTRAINT pk_tm_attempt_history PRIMARY KEY (task_type, task_id, attempt_number, partition_key)  -- -simple/-pro: omit partition_key
+    CONSTRAINT pk_tm_attempt_history PRIMARY KEY (task_type, task_id, attempt_count, retry_count, partition_key)  -- -simple/-pro: omit partition_key
 );
 
 -- ---- tm_audit_event (operator/cluster actions only) ------------------

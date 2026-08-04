@@ -22,8 +22,17 @@ import static org.junit.jupiter.api.Assertions.fail;
 /**
  * Drives the whole stack — Spring Boot starter auto-config + JPA ledger +
  * engine poller/worker pool — against H2, through real enqueue/rerun flows.
+ *
+ * <p>Isolated on its own H2 database (rather than a bare {@code @SpringBootTest}):
+ * a bare one has the exact same merged context configuration as {@link ScenarioExplorationTest}'s,
+ * so Spring's test context cache would otherwise reuse a single {@code ApplicationContext} — and
+ * hence a single, never-stopped {@code engine} bean/poller/worker pool/database — across both
+ * classes, letting one class's background work bleed into the other's assertions (this was a real,
+ * intermittently-reproducing source of flakiness in {@code ScenarioExplorationTest}).
  */
-@SpringBootTest
+@SpringBootTest(properties = {
+        "spring.datasource.url=jdbc:h2:mem:e2edb;DB_CLOSE_DELAY=-1"
+})
 class EngineEndToEndTest {
 
     @Autowired

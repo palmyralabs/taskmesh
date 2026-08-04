@@ -27,8 +27,14 @@ import static org.junit.jupiter.api.Assertions.fail;
  * Adversarial scenarios — deliberately trying to break the engine end-to-end
  * against H2: retry/backoff, exhaustion, pause gating, concurrent duplicate
  * enqueue, and high-volume churn.
+ *
+ * <p>Isolated on its own H2 database — see {@link EngineEndToEndTest}'s Javadoc for why a bare
+ * {@code @SpringBootTest} here would otherwise share Spring's cached context (and hence the live
+ * {@code engine} bean) with that class, causing intermittent cross-test interference.
  */
-@SpringBootTest
+@SpringBootTest(properties = {
+        "spring.datasource.url=jdbc:h2:mem:scenariodb;DB_CLOSE_DELAY=-1"
+})
 class ScenarioExplorationTest {
 
     @Autowired private TaskMeshEngine engine;
@@ -47,7 +53,8 @@ class ScenarioExplorationTest {
         // counts aren't guaranteed — under contention a task can be executed/requeued more than the
         // minimum, so these are lower bounds, not equalities.
         assertTrue(flaky.attempts("flaky-1") >= 3, "at least 2 failures then a success");
-        assertTrue(taskRow(ref).getAttemptCount() >= 2, "at least the 2 requeues recorded");
+        assertEquals(1, taskRow(ref).getAttemptCount(), "no operator rerun happened, so it stays attempt 1 (D33)");
+        assertTrue(taskRow(ref).getRetryCount() >= 2, "at least the 2 retries recorded on the inner counter");
     }
 
     @Test

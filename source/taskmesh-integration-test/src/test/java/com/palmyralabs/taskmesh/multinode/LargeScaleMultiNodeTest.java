@@ -16,6 +16,7 @@ import com.palmyralabs.taskmesh.starter.TaskmeshProperties;
 import com.palmyralabs.taskmesh.starter.WorkloadProfile;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -39,7 +40,12 @@ import static org.junit.jupiter.api.Assertions.fail;
  * Soak/scale test: 50,000 tasks, each sleeping a random 2–5s, across 4 engines
  * sharing one H2 database. Validates no-loss delivery, cross-node balancing, and
  * that the lock-order fix holds under sustained enqueue+claim+release churn.
+ *
+ * <p>Tagged {@code stress} — excluded from the default {@code test} task
+ * (see {@code taskmesh-integration-test/build.gradle}); run via {@code
+ * ./gradlew :taskmesh-integration-test:stressTest}.
  */
+@Tag("stress")
 @SpringBootTest(classes = MultiNodeTestApp.class, properties = {
         "spring.datasource.url=jdbc:h2:mem:largedb;DB_CLOSE_DELAY=-1",
         "spring.jpa.hibernate.ddl-auto=create-drop",

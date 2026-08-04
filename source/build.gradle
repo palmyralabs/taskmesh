@@ -31,4 +31,36 @@ subprojects {
     tasks.withType(Test).configureEach {
         useJUnitPlatform()
     }
+
+    // -Ppg: run the JPA tiers against a real Postgres instead of H2, with
+    // ddl-auto=validate against the hand-applied reference DDL. See the Postgres
+    // note in CLAUDE.md for what H2 cannot catch.
+    if (project.hasProperty('pg')) {
+        dependencies {
+            testRuntimeOnly 'org.postgresql:postgresql:42.7.3'
+        }
+        def db = ['taskmesh-simple': 'tm_simple', 'taskmesh-pro': 'tm_pro', 'taskmesh-max': 'tm_max'][project.name]
+        if (db != null) {
+            tasks.withType(Test).configureEach {
+                systemProperty 'spring.test.database.replace', 'NONE'
+                systemProperty 'spring.datasource.url', "jdbc:postgresql://localhost:55433/${db}"
+                systemProperty 'spring.datasource.username', 'taskmesh'
+                systemProperty 'spring.datasource.password', 'taskmesh'
+                systemProperty 'spring.datasource.driver-class-name', 'org.postgresql.Driver'
+                systemProperty 'spring.jpa.hibernate.ddl-auto', 'validate'
+                // The JDBC driver hands the JVM's default zone to the server, and Postgres 16
+                // rejects the legacy alias this host reports (Asia/Calcutta vs Asia/Kolkata).
+                systemProperty 'user.timezone', 'UTC'
+                // The torture suites run many simulated nodes, each opening short transactions back
+                // to back; the default pool of 10 becomes the bottleneck long before Postgres does.
+                // Sized to comfortably exceed the node count so a node never queues for a connection.
+                systemProperty 'spring.datasource.hikari.maximum-pool-size', '64'
+                systemProperty 'spring.datasource.hikari.minimum-idle', '16'
+                systemProperty 'taskmesh.torture.nodes', (project.findProperty('tortureNodes') ?: '16')
+                systemProperty 'taskmesh.torture.tasks', (project.findProperty('tortureTasks') ?: '100000')
+                maxHeapSize = '4g'
+                jvmArgs '-XX:+UseParallelGC'
+            }
+        }
+    }
 }
