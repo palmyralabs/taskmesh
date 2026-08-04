@@ -15,8 +15,8 @@ public class InMemoryTaskLedger implements TaskLedger {
     private final InMemoryTaskStore store;
 
     @Override
-    public List<TaskRef> pullPending(String taskType, Instant now, int limit) {
-        return store.findClaimable(taskType, now, limit);
+    public List<TaskRef> pullPending(Instant now, int limit) {
+        return store.findClaimable(now, limit);
     }
 
     @Override

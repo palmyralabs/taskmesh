@@ -88,7 +88,7 @@ class MultiNodeTaskLedgerTest {
         transactionTemplate.executeWithoutResult(status -> {
             TmInFlightEntity row = inFlightRow(taskRef);
             row.setUpdatedAt(when);
-            row.setNextRetryAt(null);
+            row.setNextRetryAt(Instant.EPOCH);   // "visible since forever" - the gate is a timestamp now, never null
             inFlightRepository.save(row);
         });
     }
@@ -98,7 +98,7 @@ class MultiNodeTaskLedgerTest {
         transactionTemplate.executeWithoutResult(status -> {
             TmInFlightEntity row = inFlightRow(taskRef);
             row.setLeaseExpiresAt(Instant.now().minus(Duration.ofMinutes(1)));
-            row.setNextRetryAt(null);
+            row.setNextRetryAt(Instant.EPOCH);   // "visible since forever" - the gate is a timestamp now, never null
             inFlightRepository.save(row);
         });
     }
@@ -239,7 +239,7 @@ class MultiNodeTaskLedgerTest {
         // queued was enqueued by node1 (reserved to it) — age it past the reservation window so node2 can see it.
         backdateUpdatedAt(queued, Instant.now().minus(Duration.ofMinutes(5)));
 
-        List<TaskRef> node2Pending = node2.pullPending("T", Instant.now(), 100);
+        List<TaskRef> node2Pending = node2.pullPending(Instant.now(), 100);
 
         assertTrue(node2Pending.contains(queued), "QUEUED past its reservation window is open to any node");
         assertTrue(node2Pending.contains(claimedByNode1Stale), "stale claim (past claimTimeout) must be stealable");
@@ -439,7 +439,7 @@ class MultiNodeTaskLedgerTest {
         assertEquals(TaskStatus.YIELDED, hot.getStatus(), "a yield parks the row in its own status, not QUEUED");
         assertEquals(1, hot.getAttemptCount(), "a yield is not a new attempt");
         assertEquals(1, hot.getRetryCount(), "a yield consumes no retry budget");
-        assertNull(hot.getNextRetryAt(), "a yield sets no backoff gate — it must be immediately claimable");
+        assertFalse(hot.getNextRetryAt().isAfter(Instant.now()), "a yield leaves no future backoff gate — it must be immediately claimable");
         assertEquals(ClaimOutcome.WON, node1.claim(taskRef), "immediately re-claimable after a yield");
         assertEquals(1, inFlightRow(taskRef).getRetryCount(),
                 "and resuming a yield is the one claim that bills nothing — it is the same execution");

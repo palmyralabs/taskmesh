@@ -28,8 +28,37 @@ subprojects {
         testRuntimeOnly 'org.slf4j:slf4j-simple:2.0.13'
     }
 
-    tasks.withType(Test).configureEach {
-        useJUnitPlatform()
+    // Stress work — throughput, load, soak, chaos, large-scale — is measurement, not verification:
+    // it is slow, it is sensitive to what else the machine is doing, and a number moving is not a
+    // build failure. Everything tagged @Tag("stress") stays out of `test` and runs on demand.
+    //
+    // One tag for the whole repo. This used to live in taskmesh-integration-test's own build file
+    // and so covered only that module — and because two of the three classes it named were never
+    // actually annotated, they ran on every build anyway (74s of that module's 122s).
+    // Every Test task EXCEPT stressTest itself — configuring both on the same task makes JUnit
+    // see the tag as included and excluded at once, and exclusion wins, so stressTest would
+    // silently find no tests at all.
+    tasks.withType(Test).matching { it.name != 'stressTest' }.configureEach {
+        useJUnitPlatform {
+            excludeTags 'stress'
+        }
+    }
+
+    tasks.register('stressTest', Test) {
+        group = 'verification'
+        description = 'Runs only @Tag("stress") suites — throughput, load, soak, chaos and ' +
+                'large-scale runs. Most also need -Ppg (a real Postgres); without it they self-skip.'
+        testClassesDirs = sourceSets.test.output.classesDirs
+        classpath = sourceSets.test.runtimeClasspath
+        useJUnitPlatform {
+            includeTags 'stress'
+        }
+        // A measurement Gradle serves from its cache is not a measurement: identical inputs would
+        // otherwise return a previous run's result as UP-TO-DATE in about a second.
+        outputs.upToDateWhen { false }
+        testLogging {
+            showStandardStreams = true   // the printed [engine-throughput]/[torture-xl] summaries
+        }
     }
 
     // -Ppg: run the JPA tiers against a real Postgres instead of H2, with
@@ -58,6 +87,24 @@ subprojects {
                 systemProperty 'spring.datasource.hikari.minimum-idle', '16'
                 systemProperty 'taskmesh.torture.nodes', (project.findProperty('tortureNodes') ?: '16')
                 systemProperty 'taskmesh.torture.tasks', (project.findProperty('tortureTasks') ?: '100000')
+                // PostgresEngineThroughputTest — the same run driven through real TaskMeshEngineImpl
+                // instances and real TaskProcessors, rather than straight at the ledger. Smaller
+                // default backlog: every task here pays for history writes, two lifecycle callbacks
+                // and actual CPU work, none of which the torture suites do.
+                systemProperty 'taskmesh.engine.tasks', (project.findProperty('engineTasks') ?: '10000')
+                systemProperty 'taskmesh.engine.nodes', (project.findProperty('engineNodes') ?: '3')
+                systemProperty 'taskmesh.engine.workers', (project.findProperty('engineWorkers') ?: '8')
+                systemProperty 'taskmesh.engine.batch', (project.findProperty('engineBatch') ?: '100')
+                systemProperty 'taskmesh.engine.queue', (project.findProperty('engineQueue') ?: '100')
+                systemProperty 'taskmesh.engine.interval', (project.findProperty('engineInterval') ?: '1')
+                systemProperty 'taskmesh.engine.work', (project.findProperty('engineWork') ?: '200')
+                systemProperty 'taskmesh.engine.sleep', (project.findProperty('engineSleep') ?: '0')
+                // taskmesh-max only: EAGER (hot row at enqueue) vs THROTTLED (bounded in-flight window).
+                systemProperty 'taskmesh.engine.promotion', (project.findProperty('enginePromotion') ?: 'EAGER')
+                systemProperty 'taskmesh.engine.lowWatermark', (project.findProperty('engineLow') ?: '500')
+                systemProperty 'taskmesh.engine.highWatermark', (project.findProperty('engineHigh') ?: '1000')
+                systemProperty 'taskmesh.engine.backlogBatch', (project.findProperty('engineBacklogBatch') ?: '500')
+                systemProperty 'taskmesh.engine.backlogInterval', (project.findProperty('engineBacklogInterval') ?: '1')
                 maxHeapSize = '4g'
                 jvmArgs '-XX:+UseParallelGC'
             }

@@ -19,7 +19,7 @@ import java.util.List;
  */
 public interface TaskLedger {
 
-    List<TaskRef> pullPending(String taskType, Instant now, int limit);
+    List<TaskRef> pullPending(Instant now, int limit);
 
     void enqueue(TaskRef taskRef);
 

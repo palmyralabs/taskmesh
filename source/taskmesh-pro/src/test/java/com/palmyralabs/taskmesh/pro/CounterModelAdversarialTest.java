@@ -36,6 +36,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -105,7 +106,7 @@ class CounterModelAdversarialTest {
             TmInFlightEntity row = hot(taskRef);
             row.setLeaseExpiresAt(Instant.now().minus(Duration.ofMinutes(1)));
             row.setUpdatedAt(Instant.now().minus(Duration.ofMinutes(30)));   // past claimTimeout
-            row.setNextRetryAt(null);
+            row.setNextRetryAt(Instant.EPOCH);   // "visible since forever" - the gate is a timestamp now, never null
             inFlightRepository.save(row);
         });
     }
@@ -114,7 +115,7 @@ class CounterModelAdversarialTest {
         transactionTemplate.executeWithoutResult(status -> {
             TmInFlightEntity row = hot(taskRef);
             row.setUpdatedAt(Instant.now().minus(Duration.ofMinutes(30)));
-            row.setNextRetryAt(null);
+            row.setNextRetryAt(Instant.EPOCH);   // "visible since forever" - the gate is a timestamp now, never null
             inFlightRepository.save(row);
         });
     }
@@ -304,7 +305,7 @@ class CounterModelAdversarialTest {
         for (int i = 0; i < 10; i++) {
             assertEquals(ReleaseOutcome.OK, node1.release(ref, ReleaseRequest.yielded("PAUSE", "cycle " + i)));
             assertEquals(TaskStatus.YIELDED, hot(ref).getStatus());
-            assertNull(hot(ref).getNextRetryAt(), "and never gates the next claim");
+            assertFalse(hot(ref).getNextRetryAt().isAfter(Instant.now()), "and never gates the next claim");
             assertEquals(ClaimOutcome.WON, node1.claim(ref));
             assertCounters(ref, 1, 3);
         }

@@ -177,7 +177,7 @@ class PostgresTortureTest {
             PartitionedTaskLedger ledger = nodes.get(node);
             int drained = 0;
             for (int round = 0; round < TASKS * 2; round++) {
-                List<TaskRef> pending = inTx(() -> ledger.pullPending(TYPE, Instant.now(), 20));
+                List<TaskRef> pending = inTx(() -> ledger.pullPending(Instant.now(), 20));
                 if (pending.isEmpty()) {
                     break;
                 }

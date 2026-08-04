@@ -91,7 +91,7 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
      * onto the returned {@link TaskRef}.
      */
     @Query("SELECT new com.palmyralabs.taskmesh.api.TaskRef(f.taskType, f.taskId, f.partitionKey) FROM TmInFlightEntity f "
-            + "WHERE f.taskType = :taskType AND (f.nextRetryAt IS NULL OR f.nextRetryAt <= :now) AND ("
+            + "WHERE f.nextRetryAt <= :now AND ("
             + "     f.status IS NULL "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.QUEUED    AND f.nodeId = :nodeId) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.QUEUED    AND (f.nodeId IS NULL OR f.updatedAt < :reservationCutoff)) "
@@ -101,8 +101,8 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.RELEASED  AND f.nodeId = :nodeId AND f.updatedAt >= :affinityCutoff) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.RELEASED  AND (f.updatedAt IS NULL OR f.updatedAt < :affinityCutoff)) "
             + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.CLAIMED   AND f.updatedAt < :claimTimeoutCutoff)"
-            + ") ORDER BY f.createdAt ASC")
-    List<TaskRef> findClaimable(@Param("taskType") String taskType, @Param("nodeId") String nodeId,
+            + ") ORDER BY f.nextRetryAt ASC")
+    List<TaskRef> findClaimable(@Param("nodeId") String nodeId,
                                  @Param("now") Instant now, @Param("reservationCutoff") Instant reservationCutoff,
                                  @Param("affinityCutoff") Instant affinityCutoff,
                                  @Param("claimTimeoutCutoff") Instant claimTimeoutCutoff, Pageable pageable);
@@ -119,14 +119,14 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
      * Cooperative yield (D33) — the owner hands unfinished work back while its
      * lease is still valid. Parks the row in {@code YIELDED} (its own status, so
      * the next claim knows not to bill it) reserved to the same node,
-     * drops the lease, and clears the backoff gate: no retry budget is consumed
+     * drops the lease, and opens the backoff gate (set to now, never null - the column is populated on every row so discovery can order by it): no retry budget is consumed
      * and nothing gates re-claim, so it is immediately claimable again once
      * whatever caused the yield clears. Fenced by {@code node_id} like every
      * other release.
      */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmInFlightEntity f SET f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.YIELDED, "
-            + "f.leaseExpiresAt = null, f.nextRetryAt = null, f.updatedAt = :now "
+            + "f.leaseExpiresAt = null, f.nextRetryAt = :now, f.updatedAt = :now "
             + "WHERE f.taskType = :taskType AND f.taskId = :taskId AND f.nodeId = :nodeId "
             + "AND f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.CLAIMED")
     int markYielded(@Param("taskType") String taskType, @Param("taskId") String taskId,
@@ -150,7 +150,7 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmInFlightEntity f SET f.status = null, f.nodeId = null, f.claimedAt = null, "
             + "f.leaseExpiresAt = null, f.attemptCount = f.attemptCount + 1, f.retryCount = -1, "
-            + "f.nextRetryAt = null, f.updatedAt = :now "
+            + "f.nextRetryAt = :now, f.updatedAt = :now "
             + "WHERE f.taskType = :taskType AND f.taskId = :taskId")
     int resetForRerun(@Param("taskType") String taskType, @Param("taskId") String taskId, @Param("now") Instant now);
 
@@ -166,4 +166,42 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
             + "AND f.status IN (com.palmyralabs.taskmesh.max.entity.TaskStatus.CLAIMED, "
             + "com.palmyralabs.taskmesh.max.entity.TaskStatus.RELEASED) GROUP BY f.status")
     List<Object[]> countByTaskType(@Param("taskType") String taskType);
+
+    /**
+     * How much claimable work this node has right now, across <b>every</b> task type — the
+     * in-flight level {@link com.palmyralabs.taskmesh.max.JpaBacklogPromoter} regulates against.
+     *
+     * <p><b>Third copy of the eligibility block — keep it in exact sync with {@link #claim} and
+     * {@link #findClaimable}.</b> It is {@link #findClaimable}'s {@code WHERE} verbatim, including
+     * the {@code next_retry_at} backoff gate, with only the {@code taskType} filter dropped and
+     * the projection replaced by a count. Anything that changes eligibility has to change here
+     * too, or the promoter will size the window against a different notion of "claimable" than the
+     * poller actually claims — which surfaces as workers idling in front of a full window, or a
+     * window that never stops refilling.
+     *
+     * <p>Deliberately not scoped by {@code taskType}, unlike everything else here: the window is a
+     * property of the node's capacity, not of any one task type. Scoping it per type would
+     * multiply the configured window by however many types happen to be registered.
+     *
+     * <p>{@code QUEUED} rows are counted, unlike in {@link #countByTaskType} — there the exclusion
+     * exists because that rollup is an operational view whose QUEUED count comes from the cold
+     * side. Here a promoted-but-not-yet-claimed row is exactly what promotion just produced, and
+     * ignoring it would make the promoter blind to its own output and refill every cycle.
+     */
+    @Query("SELECT COUNT(f) FROM TmInFlightEntity f "
+            + "WHERE f.nextRetryAt <= :now AND ("
+            + "     f.status IS NULL "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.QUEUED    AND f.nodeId = :nodeId) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.QUEUED    AND (f.nodeId IS NULL OR f.updatedAt < :reservationCutoff)) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.YIELDED   AND f.nodeId = :nodeId) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.YIELDED   AND (f.nodeId IS NULL OR f.updatedAt < :reservationCutoff)) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.CLAIMED   AND f.nodeId = :nodeId) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.RELEASED  AND f.nodeId = :nodeId AND f.updatedAt >= :affinityCutoff) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.RELEASED  AND (f.updatedAt IS NULL OR f.updatedAt < :affinityCutoff)) "
+            + "  OR (f.status = com.palmyralabs.taskmesh.max.entity.TaskStatus.CLAIMED   AND f.updatedAt < :claimTimeoutCutoff)"
+            + ")")
+    long countClaimable(@Param("nodeId") String nodeId, @Param("now") Instant now,
+                         @Param("reservationCutoff") Instant reservationCutoff,
+                         @Param("affinityCutoff") Instant affinityCutoff,
+                         @Param("claimTimeoutCutoff") Instant claimTimeoutCutoff);
 }

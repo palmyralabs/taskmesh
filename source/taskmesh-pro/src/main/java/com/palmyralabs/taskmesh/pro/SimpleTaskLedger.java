@@ -194,8 +194,8 @@ public class SimpleTaskLedger implements ClaimStrategy, TaskLedger {
     }
 
     @Override
-    public List<TaskRef> pullPending(String taskType, Instant now, int limit) {
-        return inFlightRepository.findClaimableSingleNode(taskType, now, PageRequest.of(0, limit));
+    public List<TaskRef> pullPending(Instant now, int limit) {
+        return inFlightRepository.findClaimableSingleNode(now, PageRequest.of(0, limit));
     }
 
     @Override

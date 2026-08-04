@@ -19,22 +19,13 @@ tasks.withType(Test).configureEach {
     jvmArgs '-Xss512k'
 }
 
-// Long-running load/soak/chaos tests (LongRunningLoadTest, LargeScaleMultiNodeTest,
-// MultiNodeChaosTest — each tagged @Tag("stress")) are excluded from the default
-// `test` task, which everyone runs constantly, and live behind their own `stressTest`
-// task instead. Run explicitly: ./gradlew :taskmesh-integration-test:stressTest
-test {
-    useJUnitPlatform {
-        excludeTags 'stress'
-    }
-}
-
-tasks.register('stressTest', Test) {
-    group = 'verification'
-    description = 'Runs the long-running load/soak/chaos tests tagged @Tag("stress")'
-    testClassesDirs = sourceSets.test.output.classesDirs
-    classpath = sourceSets.test.runtimeClasspath
-    useJUnitPlatform {
-        includeTags 'stress'
-    }
-}
+// The long-running load/soak/chaos suites here (LongRunningLoadTest, LargeScaleMultiNodeTest,
+// MultiNodeChaosTest) are tagged @Tag("stress") and excluded from `test` by the root build,
+// along with the tiers' throughput and large-scale torture suites. One tag, one exclusion,
+// one task, for every module:
+//
+//     ./gradlew :taskmesh-integration-test:stressTest
+//
+// The exclusion used to live here, so it covered only this module — and because two of the
+// three classes named above were never actually annotated, it did not exclude them at all.
+// They ran on every build: 74s of the ~122s this module spent.

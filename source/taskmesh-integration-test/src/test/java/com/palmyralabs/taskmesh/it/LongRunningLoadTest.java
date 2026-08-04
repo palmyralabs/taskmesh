@@ -4,6 +4,7 @@ import com.palmyralabs.taskmesh.api.TaskRef;
 import com.palmyralabs.taskmesh.engine.TaskMeshEngine;
 import com.palmyralabs.taskmesh.simple.entity.TaskStatus;
 import com.palmyralabs.taskmesh.simple.repository.TmTaskRepository;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -23,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  * (roughly 60s of wall time), exercising real queueing/hand-off — not just a
  * one-shot fan-out.
  */
+@Tag("stress")
 @SpringBootTest(properties = {
         "taskmesh.worker-pool-size=32",
         "taskmesh.query-interval-seconds=1",

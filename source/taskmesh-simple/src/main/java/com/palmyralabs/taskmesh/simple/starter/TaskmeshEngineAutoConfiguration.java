@@ -187,6 +187,10 @@ public class TaskmeshEngineAutoConfiguration {
                         .workerPoolSize(properties.getWorkerPoolSize())
                         .batchSize(properties.getBatchSize())
                         .queryIntervalSeconds(properties.getQueryIntervalSeconds())
+                        .queueCapacity(properties.getQueueCapacity())
+                        .adaptivePolling(properties.isAdaptivePolling())
+                        .pollMinMillis(properties.getPollMinMillis())
+                        .pollMaxMillis(properties.getPollMaxMillis())
                         .build())
                 .build();
         engine.start();

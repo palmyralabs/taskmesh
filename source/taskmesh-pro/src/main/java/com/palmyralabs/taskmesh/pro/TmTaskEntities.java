@@ -67,6 +67,11 @@ final class TmTaskEntities {
         Instant now = Instant.now();
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
+        // Populated at creation, not left null: next_retry_at is the row's "not visible before"
+        // instant, and a brand-new row is visible immediately. Behaviourally identical to null —
+        // discovery's gate admits both — but it keeps the column populated on every row, which is
+        // what lets discovery order by it instead of by created_at.
+        entity.setNextRetryAt(now);
         return entity;
     }
 }

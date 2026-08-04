@@ -100,7 +100,7 @@ public class TmInFlightEntity {
     private int maxRetries;
 
     /** Backoff gate for a requeued row — discovery skips it until this passes. {@code null} = immediately eligible. */
-    @Column(name = "next_retry_at")
+    @Column(name = "next_retry_at", nullable = false)
     private Instant nextRetryAt;
 
     @Column(name = "claimed_at")

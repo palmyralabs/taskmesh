@@ -12,6 +12,7 @@ import com.palmyralabs.taskmesh.api.ReleaseOutcome;
 import com.palmyralabs.taskmesh.api.ReleaseRequest;
 import com.palmyralabs.taskmesh.api.TaskRef;
 import org.junit.jupiter.api.BeforeEach;
+import java.time.Instant;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
@@ -20,6 +21,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -125,7 +127,7 @@ class SimpleTaskLedgerTest {
         ledger.enqueue(claimed);
         ledger.claim(claimed);
 
-        var pending = ledger.pullPending("T", java.time.Instant.now(), 100);
+        var pending = ledger.pullPending(java.time.Instant.now(), 100);
 
         assertEquals(1, pending.size());
         assertEquals(queued, pending.get(0));
@@ -166,7 +168,7 @@ class SimpleTaskLedgerTest {
         assertEquals(TaskStatus.YIELDED, hot.getStatus(), "a yield parks the row in its own status");
         assertEquals(1, hot.getAttemptCount(), "a yield is not a new attempt");
         assertEquals(1, hot.getRetryCount(), "a yield consumes no retry budget");
-        assertNull(hot.getNextRetryAt(), "a yield clears the backoff gate — it must be immediately claimable");
+        assertFalse(hot.getNextRetryAt().isAfter(Instant.now()), "a yield leaves no future backoff gate — it must be immediately claimable");
         assertEquals(ClaimOutcome.WON, ledger.claim(taskRef), "immediately re-claimable after a yield");
     }
 

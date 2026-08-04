@@ -10,6 +10,7 @@ import com.palmyralabs.taskmesh.api.ReleaseRequest;
 import com.palmyralabs.taskmesh.api.TaskRef;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -47,6 +48,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * other. The invariants are the ones that would quietly break at volume —
  * nothing claimed twice, nothing left stranded, nothing lost.
  */
+@Tag("stress")
 @DataJpaTest
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 @EnabledIfSystemProperty(named = "spring.datasource.driver-class-name", matches = "org\\.postgresql\\.Driver")
@@ -157,7 +159,7 @@ class PostgresLargeScaleTortureTest {
                     while (emptyPolls < 3) {
                         // Discovery is a read, so it needs no boundary of its own — one fewer
                         // transaction per poll matters when there are 100k of them.
-                        List<TaskRef> polled = ledger.pullPending(TYPE, Instant.now(), POLL_BATCH);
+                        List<TaskRef> polled = ledger.pullPending(Instant.now(), POLL_BATCH);
                         // Every node's poll returns the same oldest rows in the same order, so
                         // walking them in order means all of them fight over the same task at the
                         // same moment: at batch 50 this produced 13 lost claims per task. Shuffling

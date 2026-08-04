@@ -4,6 +4,7 @@ import com.palmyralabs.taskmesh.max.entity.TaskId;
 import com.palmyralabs.taskmesh.max.repository.TmInFlightRepository;
 import com.palmyralabs.taskmesh.max.repository.TmTaskRepository;
 
+import com.palmyralabs.taskmesh.api.ReleaseRequest;
 import com.palmyralabs.taskmesh.api.TaskRef;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -12,9 +13,11 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.time.Duration;
 import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Exercises the throttled promotion path: onEnqueue is a no-op, promote() is bounded and idempotent per row. */
@@ -43,7 +46,32 @@ class JpaBacklogPromoterTest {
                 new ExponentialBackoffRetryPolicy(3, java.time.Duration.ofMillis(1), java.time.Duration.ofMillis(1)),
                 java.time.Duration.ofMinutes(5), java.time.Duration.ofSeconds(30), java.time.Duration.ofSeconds(60),
                 java.time.Duration.ofMinutes(10), java.time.Duration.ofSeconds(60));
-        promoter = new JpaBacklogPromoter(taskRepository, inFlightRepository, transactionTemplate, "node-1");
+        promoter = windowed(500, 1000);   // production defaults; far above anything these tests enqueue
+    }
+
+    /** A promoter with an explicit in-flight window, for the watermark tests below. */
+    private JpaBacklogPromoter windowed(int low, int high) {
+        return windowed(ledger, low, high);
+    }
+
+    private JpaBacklogPromoter windowed(PartitionedTaskLedger against, int low, int high) {
+        return new JpaBacklogPromoter(taskRepository, inFlightRepository, transactionTemplate, against, "node-1", low, high);
+    }
+
+    private void enqueueAll(String taskType, int count) {
+        for (int i = 0; i < count; i++) {
+            ledger.enqueue(new TaskRef(taskType, taskType + "-" + i, P));
+        }
+    }
+
+    /** Total hot rows — the table level, deliberately not the claimable level the window regulates. */
+    private long hotRows() {
+        return inFlightRepository.count();
+    }
+
+    /** What the poller would actually pick up: the level the window is measured against. */
+    private long claimable() {
+        return ledger.countClaimable(Instant.now());
     }
 
     @Test
@@ -153,5 +181,144 @@ class JpaBacklogPromoterTest {
 
         assertEquals(0, promoter.promote("T", Instant.now(), 10),
                 "so the backlog scan must not pick it up at all");
+    }
+
+    // ---- in-flight window -------------------------------------------------------
+
+    /**
+     * The whole point of the window: a backlog far larger than the high watermark
+     * must not land in {@code tm_in_flight} in one go, however generous the engine's
+     * per-cycle limit is.
+     */
+    @Test
+    void promoteStopsAtTheHighWatermarkNoMatterHowDeepTheBacklogIs() {
+        enqueueAll("W1", 40);
+
+        int promoted = windowed(3, 5).promote("W1", Instant.now(), 1000);
+
+        assertEquals(5, promoted, "promotion fills the window, not the backlog");
+        assertEquals(5, hotRows(), "and tm_in_flight is held at the high watermark");
+    }
+
+    /**
+     * Hysteresis. Between the two marks the promoter does nothing at all — otherwise
+     * a busy queue would be topped up by a row or two on every cycle, paying a
+     * transaction each time for almost no work.
+     */
+    @Test
+    void promoteDoesNothingWhileTheLevelIsStillAboveTheLowWatermark() {
+        enqueueAll("W2", 40);
+        JpaBacklogPromoter promoter = windowed(3, 5);
+        assertEquals(5, promoter.promote("W2", Instant.now(), 1000));
+
+        assertEquals(0, promoter.promote("W2", Instant.now(), 1000),
+                "level is 5, still at/above the low watermark of 3 — nothing to do");
+        assertEquals(0, promoter.promote("W2", Instant.now(), 1000), "and it stays that way across cycles");
+        assertEquals(5, hotRows());
+    }
+
+    /**
+     * ...and it does resume. This is the regulation half: a rate-only throttle would
+     * have kept promoting regardless of the level, and a level check with no refill
+     * path would stall the queue permanently once it dipped.
+     */
+    @Test
+    void promoteTopsBackUpOnceTheLevelFallsBelowTheLowWatermark() {
+        enqueueAll("W3", 40);
+        JpaBacklogPromoter promoter = windowed(3, 5);
+        promoter.promote("W3", Instant.now(), 1000);
+        assertEquals(5, hotRows());
+
+        // Three tasks reach a terminal outcome, which deletes their hot rows: level 5 -> 2.
+        transactionTemplate.executeWithoutResult(status -> {
+            for (int i = 0; i < 3; i++) {
+                inFlightRepository.deleteByTaskTypeAndTaskId("W3", "W3-" + i);
+            }
+        });
+        assertEquals(2, hotRows(), "precondition: the level dipped below the low watermark");
+
+        assertEquals(3, promoter.promote("W3", Instant.now(), 1000), "refills the deficit, 2 -> 5");
+        assertEquals(5, hotRows(), "back to the high watermark");
+    }
+
+    /**
+     * The engine's {@code limit} still caps one cycle — the {@code BacklogPromoter}
+     * contract is "up to limit", and a single promotion transaction stays bounded
+     * however deep the deficit is. The window is then reached over several cycles.
+     */
+    @Test
+    void promoteHonoursTheEngineLimitWhenItIsSmallerThanTheDeficit() {
+        enqueueAll("W4", 40);
+        JpaBacklogPromoter promoter = windowed(10, 20);
+
+        assertEquals(4, promoter.promote("W4", Instant.now(), 4), "capped by limit, not by the deficit of 20");
+        assertEquals(4, promoter.promote("W4", Instant.now(), 4), "level 4 is still below the low watermark of 10");
+        assertEquals(8, hotRows());
+    }
+
+    /**
+     * A misconfigured window fails at construction rather than presenting later as a
+     * queue that silently never drains — a zero low mark promotes nothing ever, and an
+     * inverted pair computes a negative deficit.
+     */
+    @Test
+    void rejectsAWindowThatCouldNeverPromoteAnything() {
+        assertThrows(IllegalArgumentException.class, () -> windowed(0, 100), "a zero low watermark never promotes");
+        assertThrows(IllegalArgumentException.class, () -> windowed(-1, 100), "nor a negative one");
+        assertThrows(IllegalArgumentException.class, () -> windowed(100, 99), "nor an inverted window");
+    }
+
+    /** A single mark (low == high) is a legitimate no-hysteresis configuration, not a mistake. */
+    @Test
+    void acceptsAWindowWithBothMarksEqual() {
+        enqueueAll("W5", 10);
+
+        assertEquals(4, windowed(4, 4).promote("W5", Instant.now(), 1000));
+        assertEquals(4, hotRows());
+    }
+
+    /**
+     * The reason the window is measured with {@code countClaimable} and not a plain
+     * {@code COUNT(*)}: a row released for retry keeps its hot row but is unclaimable until
+     * {@code next_retry_at} passes. Counting rows rather than claimable work would read that
+     * as a full window and stop promoting — starving every worker precisely when the failure
+     * rate is highest, which is when the queue can least afford it.
+     */
+    @Test
+    void rowsInsideTheirRetryBackoffDoNotCountTowardsTheWindow() {
+        // Retries back off for minutes here, so a released row is genuinely unclaimable for
+        // the whole test rather than for the 1ms the other tests' ledger uses.
+        PartitionedTaskLedger backingOff = new PartitionedTaskLedger(taskRepository, inFlightRepository,
+                transactionTemplate, () -> "node-1",
+                new ExponentialBackoffRetryPolicy(3, Duration.ofMinutes(10), Duration.ofMinutes(10)),
+                Duration.ofMinutes(5), Duration.ofSeconds(30), Duration.ofSeconds(60),
+                Duration.ofMinutes(10), Duration.ofSeconds(60));
+        JpaBacklogPromoter promoter = windowed(backingOff, 2, 2);
+
+        enqueueAll("B", 10);
+        assertEquals(2, promoter.promote("B", Instant.now(), 1000));
+        assertEquals(2, backingOff.countClaimable(Instant.now()), "window filled");
+
+        // Both promoted tasks fail retryably — within budget, so they keep their hot rows.
+        transactionTemplate.executeWithoutResult(status -> {
+            for (int i = 0; i < 2; i++) {
+                TaskRef ref = new TaskRef("B", "B-" + i, P);
+                ledgerClaimAndRetry(backingOff, ref);
+            }
+        });
+
+        assertEquals(2, hotRows(), "a retry keeps its hot row — the rows are still on the table");
+        assertEquals(0, backingOff.countClaimable(Instant.now()),
+                "but none is claimable: next_retry_at is ten minutes out");
+
+        assertEquals(2, promoter.promote("B", Instant.now(), 1000),
+                "so as far as the poller is concerned the window is empty, and promotion refills it");
+        assertEquals(4, hotRows(),
+                "and tm_in_flight now exceeds the window — backed-off retries sit on top of it, by design");
+    }
+
+    private void ledgerClaimAndRetry(PartitionedTaskLedger against, TaskRef ref) {
+        against.claim(ref);
+        against.release(ref, ReleaseRequest.retry("BOOM", "transient failure"));
     }
 }

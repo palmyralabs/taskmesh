@@ -238,8 +238,8 @@ public class MultiNodeTaskLedger implements ClaimStrategy, TaskLedger {
     }
 
     @Override
-    public List<TaskRef> pullPending(String taskType, Instant now, int limit) {
-        return inFlightRepository.findClaimableMultiNode(taskType, nodeInfoProvider.nodeId(), now,
+    public List<TaskRef> pullPending(Instant now, int limit) {
+        return inFlightRepository.findClaimableMultiNode(nodeInfoProvider.nodeId(), now,
                 now.minus(reservationWindow), now.minus(affinityWindow), now.minus(claimTimeout), PageRequest.of(0, limit));
     }
 

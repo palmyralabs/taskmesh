@@ -32,6 +32,40 @@ public class SchedulingConfig {
     @Builder.Default
     private int queryIntervalSeconds = 5;
 
+    /**
+     * Derive the poll cadence from the rate work is actually leaving the execution queue,
+     * instead of polling on a fixed {@link #queryIntervalSeconds} timer.
+     *
+     * <p>A fixed interval has to be sized against {@code workerPoolSize / perExecutionTime},
+     * which nobody knows in advance and which changes with the workload: too long and workers
+     * idle in front of a full backlog (at the old 10s default with ~44ms executions, a node ran
+     * at roughly 5% of its worker capacity), too short and it hammers the database for nothing.
+     * Adaptive polling measures the drain rate and comes back when the queue is about half
+     * empty, so the cadence follows the workload rather than a guess.
+     *
+     * <p>The query size needs no separate knob: the poller already asks for
+     * {@code min(remaining queue capacity, batchSize)}, so it naturally shrinks as the queue
+     * fills and {@code batchSize} becomes a ceiling rather than a fixed size.
+     */
+    @Builder.Default
+    private boolean adaptivePolling = true;
+
+    /** Floor on the adaptive cadence — stops a deep backlog turning into a spin loop. */
+    @Builder.Default
+    private long pollMinMillis = 50;
+
+    /** Ceiling on the adaptive cadence. 0 means "use {@link #queryIntervalSeconds}". */
+    @Builder.Default
+    private long pollMaxMillis = 0;
+
+    /**
+     * Re-poll when this fraction of the regular lane has drained. Half leaves headroom for the
+     * poll itself to complete before workers run dry, without refilling so often that each
+     * cycle returns a handful of rows.
+     */
+    @Builder.Default
+    private double pollTargetDrainFraction = 0.5;
+
     @Builder.Default
     private int safetyNetPollSeconds = 30;
 

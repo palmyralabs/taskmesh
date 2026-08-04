@@ -15,6 +15,7 @@ import com.palmyralabs.taskmesh.starter.TaskmeshProperties;
 import com.palmyralabs.taskmesh.starter.WorkloadProfile;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -38,6 +39,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  * class — those are polling ceilings, not real sleeps; measured wall time is
  * ~20s, in line with an ordinary JPA test module's Spring Boot context startup.
  */
+@Tag("stress")
 @SpringBootTest(classes = MultiNodeTestApp.class, properties = {
         "spring.datasource.url=jdbc:h2:mem:mndb;DB_CLOSE_DELAY=-1",
         "spring.jpa.hibernate.ddl-auto=create-drop"

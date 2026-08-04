@@ -212,13 +212,15 @@ public final class TaskmeshProfileBuilder {
                 : new JpaAuditEventSink(auditEventRepository);
         PauseController resolvedPauseController = pauseControllerOverride != null ? pauseControllerOverride
                 : new JpaPauseController(controlFlagRepository, Duration.ofSeconds(properties.getQueryIntervalSeconds()));
-        BacklogPromoter resolvedBacklogPromoter = backlogPromoterOverride != null ? backlogPromoterOverride
-                : new NoopBacklogPromoter(taskRepository, inFlightRepository, transactionTemplate);
-
         ClaimStrategy resolvedClaimStrategy = claimStrategyOverride != null ? claimStrategyOverride
                 : ProfileFactories.claimStrategy(properties, taskRepository, inFlightRepository,
                         transactionTemplate, resolvedNodeInfoProvider, resolvedRetryPolicy);
         TaskLedger resolvedTaskLedger = (TaskLedger) resolvedClaimStrategy;
+        // After the ledger, not before: THROTTLED promotion measures its in-flight window through
+        // the very same ledger instance the engine claims through.
+        BacklogPromoter resolvedBacklogPromoter = backlogPromoterOverride != null ? backlogPromoterOverride
+                : ProfileFactories.backlogPromoter(properties, taskRepository, inFlightRepository,
+                        transactionTemplate, resolvedClaimStrategy, resolvedNodeInfoProvider);
         HeartbeatStrategy resolvedHeartbeatStrategy = heartbeatStrategyOverride != null ? heartbeatStrategyOverride
                 : ProfileFactories.heartbeatStrategy(profile, properties, resolvedClaimStrategy, resolvedIncidentStore);
         HistoryWriter resolvedHistoryWriter = historyWriterOverride != null ? historyWriterOverride
@@ -238,11 +240,7 @@ public final class TaskmeshProfileBuilder {
                 .incidentStore(resolvedIncidentStore)
                 .metricsReporter(resolvedMetricsReporter)
                 .payloadProviderFactory(payloadProviderFactory)
-                .schedulingConfig(SchedulingConfig.builder()
-                        .workerPoolSize(properties.getWorkerPoolSize())
-                        .batchSize(properties.getBatchSize())
-                        .queryIntervalSeconds(properties.getQueryIntervalSeconds())
-                        .build())
+                .schedulingConfig(ProfileFactories.schedulingConfig(properties))
                 .build();
         engine.start();
         return engine;

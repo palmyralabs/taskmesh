@@ -257,9 +257,24 @@ public class PartitionedTaskLedger implements ClaimStrategy, TaskLedger {
     }
 
     @Override
-    public List<TaskRef> pullPending(String taskType, Instant now, int limit) {
-        return inFlightRepository.findClaimable(taskType, nodeInfoProvider.nodeId(), now,
+    public List<TaskRef> pullPending(Instant now, int limit) {
+        return inFlightRepository.findClaimable(nodeInfoProvider.nodeId(), now,
                 now.minus(reservationWindow), now.minus(affinityWindow), now.minus(claimTimeout), PageRequest.of(0, limit));
+    }
+
+    /**
+     * How much claimable work this node has across every task type — {@link #pullPending}'s
+     * eligibility, counted rather than listed and not scoped to one type.
+     *
+     * <p>Lives here rather than in {@link JpaBacklogPromoter} because this class already owns the
+     * four eligibility windows; computing the cutoffs anywhere else would mean a second component
+     * holding the same durations and drifting from them. Used to size the promoter's in-flight
+     * window, so it deliberately measures what the poller can actually pick up <em>now</em> —
+     * a row inside its {@code next_retry_at} backoff, or reserved to another node, is not it.
+     */
+    public long countClaimable(Instant now) {
+        return inFlightRepository.countClaimable(nodeInfoProvider.nodeId(), now,
+                now.minus(reservationWindow), now.minus(affinityWindow), now.minus(claimTimeout));
     }
 
     @Override

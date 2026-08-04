@@ -1,16 +1,20 @@
 package com.palmyralabs.taskmesh.max.starter;
 
+import com.palmyralabs.taskmesh.api.BacklogPromoter;
 import com.palmyralabs.taskmesh.api.ClaimStrategy;
 import com.palmyralabs.taskmesh.api.HeartbeatStrategy;
 import com.palmyralabs.taskmesh.api.HistoryWriter;
 import com.palmyralabs.taskmesh.api.IncidentStore;
 import com.palmyralabs.taskmesh.api.NodeInfoProvider;
 import com.palmyralabs.taskmesh.api.RetryPolicy;
+import com.palmyralabs.taskmesh.engine.impl.SchedulingConfig;
 import com.palmyralabs.taskmesh.max.AttemptHistoryWriter;
 import com.palmyralabs.taskmesh.max.ExplicitHeartbeatStrategy;
 import com.palmyralabs.taskmesh.max.HistoryLevel;
+import com.palmyralabs.taskmesh.max.JpaBacklogPromoter;
 import com.palmyralabs.taskmesh.max.JpaHeartbeatStrategy;
 import com.palmyralabs.taskmesh.max.JpaHistoryWriter;
+import com.palmyralabs.taskmesh.max.NoopBacklogPromoter;
 import com.palmyralabs.taskmesh.max.PartitionedTaskLedger;
 import com.palmyralabs.taskmesh.max.repository.TmAttemptHistoryRepository;
 import com.palmyralabs.taskmesh.max.repository.TmHistoryEventRepository;
@@ -63,5 +67,45 @@ final class ProfileFactories {
             case HIGH_VOLUME -> new JpaHistoryWriter(historyEventRepository, HistoryLevel.VERBOSE);
             case REACTIVE -> new JpaHistoryWriter(historyEventRepository, HistoryLevel.MINIMAL);
         };
+    }
+
+    /**
+     * Selected by {@code taskmesh.backlog-promotion}, not by {@link WorkloadProfile} —
+     * how big a backlog you enqueue at once is independent of what kind of work it is,
+     * so folding it into the profile would tie two unrelated decisions together.
+     * {@code EAGER} stays the default, so an existing deployment sees no change.
+     */
+    static BacklogPromoter backlogPromoter(TaskmeshProperties properties, TmTaskRepository taskRepository,
+                                            TmInFlightRepository inFlightRepository, TransactionTemplate transactionTemplate,
+                                            ClaimStrategy claimStrategy, NodeInfoProvider nodeInfoProvider) {
+        return switch (properties.getBacklogPromotion()) {
+            case EAGER -> new NoopBacklogPromoter(taskRepository, inFlightRepository, transactionTemplate);
+            // The same ledger instance the engine claims through, never a second one — it is what
+            // owns the eligibility windows the in-flight window is measured against.
+            case THROTTLED -> new JpaBacklogPromoter(taskRepository, inFlightRepository, transactionTemplate,
+                    (PartitionedTaskLedger) claimStrategy, nodeInfoProvider.nodeId(),
+                    properties.getInFlightLowWatermark(), properties.getInFlightHighWatermark());
+        };
+    }
+
+    /**
+     * The promoter's own scheduling, kept apart from the claim poller's
+     * {@code batchSize}/{@code queryIntervalSeconds}: promotion and claiming are
+     * driven by separate schedulers inside the engine and tuned against different
+     * things — one against how fast the window empties, the other against how fast
+     * workers finish.
+     */
+    static SchedulingConfig schedulingConfig(TaskmeshProperties properties) {
+        return SchedulingConfig.builder()
+                .workerPoolSize(properties.getWorkerPoolSize())
+                .batchSize(properties.getBatchSize())
+                .queryIntervalSeconds(properties.getQueryIntervalSeconds())
+                .queueCapacity(properties.getQueueCapacity())
+                .adaptivePolling(properties.isAdaptivePolling())
+                .pollMinMillis(properties.getPollMinMillis())
+                .pollMaxMillis(properties.getPollMaxMillis())
+                .backlogBatchSize(properties.getBacklogBatchSize())
+                .backlogIntervalSeconds(properties.getBacklogIntervalSeconds())
+                .build();
     }
 }

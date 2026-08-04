@@ -88,8 +88,36 @@ public interface TmTaskRepository extends JpaRepository<TmTaskEntity, Partitione
             + "ORDER BY t.createdAt ASC")
     List<TmTaskEntity> findUnpromoted(@Param("taskType") String taskType, Pageable pageable);
 
+    /**
+     * Claims a slice of the backlog for one promoter, and returns how many rows it won.
+     *
+     * <p>{@code AND t.promotedAt IS NULL} is what makes this a claim rather than a blind write, and
+     * it is load-bearing: every node promotes on its own unsynchronised timer and
+     * {@link #findUnpromoted} hands them all the <em>same</em> oldest rows. Without the guard, two
+     * promoters both believe they own the slice and both insert into {@code tm_in_flight}, and the
+     * loser takes a PK violation that poisons its whole transaction. With it, the second
+     * transaction blocks on the winner's row locks, re-evaluates under the winner's committed
+     * snapshot, and updates 0 rows — the same "0 rows affected = lost the race" contract the claim
+     * UPDATE uses, so the loser simply takes the next slice on its following cycle.
+     *
+     * <p>Pair with {@link #findPromotedAt} to recover exactly which rows this call won.
+     */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmTaskEntity t SET t.promotedAt = :now "
-            + "WHERE t.taskType = :taskType AND t.taskId IN :taskIds")
+            + "WHERE t.taskType = :taskType AND t.taskId IN :taskIds AND t.promotedAt IS NULL")
     int stampPromoted(@Param("taskType") String taskType, @Param("taskIds") List<String> taskIds, @Param("now") Instant now);
+
+    /**
+     * The rows a given {@link #stampPromoted} call actually won — matched on the exact
+     * {@code promoted_at} instant it wrote.
+     *
+     * <p>A row count alone is not enough: a partially-won slice has to create hot rows for the rows
+     * this promoter took and no others. {@code promoted_at} carries microsecond precision and is
+     * supplied by the caller, so it doubles as that call's marker; two promoters colliding on the
+     * identical instant would both have had to win the same guarded UPDATE, which cannot happen.
+     */
+    @Query("SELECT t FROM TmTaskEntity t WHERE t.taskType = :taskType AND t.taskId IN :taskIds "
+            + "AND t.promotedAt = :promotedAt")
+    List<TmTaskEntity> findPromotedAt(@Param("taskType") String taskType, @Param("taskIds") List<String> taskIds,
+                                       @Param("promotedAt") Instant promotedAt);
 }

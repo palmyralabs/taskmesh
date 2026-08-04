@@ -38,11 +38,13 @@ import lombok.extern.slf4j.Slf4j;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The driving implementation (D8/module-layout.md) of {@link TaskMeshEngine}:
@@ -103,6 +105,11 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
     private volatile boolean shutdownRequested = false;
 
+    /** Incremented as each queued task is picked up by a worker — the queue's consumption signal. */
+    private final AtomicLong queueConsumed = new AtomicLong();
+    /** When the poller runs next; policy lives in {@link PollCadence}, this class only obeys it. */
+    private final PollCadence pollCadence;
+
     public TaskMeshEngineImpl(NodeInfoProvider nodeInfoProvider, ProcessorRegistry processorRegistry,
                                List<String> taskTypes, ClaimStrategy claimStrategy, HeartbeatStrategy heartbeatStrategy,
                                TaskLedger taskLedger, BacklogPromoter backlogPromoter, FailureClassifier failureClassifier,
@@ -131,6 +138,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
         int regularCapacity = Math.max(1, schedulingConfig.getQueueCapacity() - SchedulingConfig.PRIORITY_QUEUE_CAPACITY);
         this.executionQueue = new FifoPriorityQueueImpl(SchedulingConfig.PRIORITY_QUEUE_CAPACITY, regularCapacity);
+        this.pollCadence = new PollCadence(schedulingConfig, regularCapacity, nodeInfoProvider.nodeId());
         this.workerPool = buildWorkerPool();
     }
 
@@ -159,9 +167,16 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         log.info("taskmesh engine starting, nodeId={}, clusterPaused={}",
                 nodeInfoProvider.nodeId(), pauseController.isPauseRequested());
         long intervalMillis = TimeUnit.SECONDS.toMillis(schedulingConfig.getQueryIntervalSeconds());
-        pollerScheduler.scheduleWithFixedDelay(this::pollOnce, 0, intervalMillis, TimeUnit.MILLISECONDS);
+        if (schedulingConfig.isAdaptivePolling()) {
+            // Self-rescheduling rather than scheduleWithFixedDelay, which cannot vary its delay.
+            pollCadence.reset(queueConsumed.get(), System.nanoTime());
+            pollerScheduler.schedule(this::adaptivePollCycle, 0, TimeUnit.MILLISECONDS);
+        } else {
+            pollerScheduler.scheduleWithFixedDelay(guarded("poller", this::pollOnce), 0, intervalMillis, TimeUnit.MILLISECONDS);
+        }
         long backlogIntervalMillis = TimeUnit.SECONDS.toMillis(schedulingConfig.getBacklogIntervalSeconds());
-        backlogScheduler.scheduleWithFixedDelay(this::promoteBacklogOnce, 0, backlogIntervalMillis, TimeUnit.MILLISECONDS);
+        backlogScheduler.scheduleWithFixedDelay(guarded("backlog promoter", this::promoteBacklogOnce),
+                0, backlogIntervalMillis, TimeUnit.MILLISECONDS);
     }
 
     @Override
@@ -306,20 +321,87 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         if (pauseController.isPauseRequested()) {
             return; // paused — the poller stops claiming new work (in-flight tasks still finish).
         }
-        for (String taskType : taskTypes) {
-            int available = Math.min(executionQueue.regularRemainingCapacity(), schedulingConfig.getBatchSize());
-            if (available <= 0) {
+        // Pagination is PollCadence's call, not batchSize's: it is bounded to a hard
+        // 16..512 so a misconfigured batch can neither trickle nor hold a huge query open.
+        int available = pollCadence.pageSize(executionQueue.regularRemainingCapacity(), schedulingConfig.getBatchSize());
+        if (available <= 0) {
+            return;
+        }
+        // One query for the whole node, ordered by next_retry_at — not one per task type. Querying
+        // per type made the ordering FIFO only *within* a type, so a task queued an hour ago waited
+        // behind one queued a second ago of a different type; worse, the queue capacity is shared
+        // and consumed in taskTypes order, so the first type could take the entire cycle and starve
+        // the rest. Registration order is not a priority scheme.
+        List<TaskRef> pending = taskLedger.pullPending(Instant.now(), available);
+        for (TaskRef taskRef : pending) {
+            // The type filter moved off the query and to here. Without it a node could claim a type
+            // it has no processor for, and the D7 path would open a NO_PROCESSOR incident and fail
+            // the task terminally — destroying work another node was equipped to run. Skipping is
+            // exactly what the old per-type query did implicitly: a type this node cannot handle is
+            // simply never picked up by it.
+            if (!processorRegistry.isRegistered(taskRef.taskType())) {
                 continue;
             }
-            List<TaskRef> pending = taskLedger.pullPending(taskType, Instant.now(), available);
-            for (TaskRef taskRef : pending) {
-                submitFromPoller(taskRef);
+            submitFromPoller(taskRef);
+        }
+    }
+
+    /**
+     * Wraps a scheduled task so a throw cannot silently retire it.
+     *
+     * <p>{@code scheduleWithFixedDelay} cancels all future executions the first time its task
+     * throws, and the thread factory installs no handler — so a single transient DB error would
+     * stop this node polling or promoting for the life of the JVM, with nothing logged and the node
+     * still looking healthy. Observed for real: two of three nodes' promoters died on one
+     * duplicate-key collision and never ran again, and the only symptom was a slow queue.
+     */
+    private Runnable guarded(String what, Runnable task) {
+        return () -> {
+            try {
+                task.run();
+            } catch (Exception e) {
+                // Swallowed deliberately — the next cycle is a fresh attempt, and losing the
+                // schedule is far worse than losing one cycle. Loud, per runtime-flow.md: whatever
+                // made this fail is a real fault, not routine contention.
+                log.error("taskmesh {} cycle failed on node {}; the schedule continues and will retry next cycle",
+                        what, nodeInfoProvider.nodeId(), e);
+            } catch (Error e) {
+                log.error("taskmesh {} cycle hit a JVM-level error on node {}; the schedule is being abandoned",
+                        what, nodeInfoProvider.nodeId(), e);
+                throw e;   // OOM/NoClassDefFound is not something a retry fixes
             }
+        };
+    }
+
+    /**
+     * One adaptive poll, then re-arms itself at a delay derived from how fast work is actually
+     * leaving the queue. {@code guarded} keeps a failed cycle from killing the loop, exactly as
+     * the fixed-interval path relies on it.
+     */
+    private void adaptivePollCycle() {
+        guarded("poller", this::pollOnce).run();
+        long delay = pollCadence.nextDelayMillis(queueConsumed.get(), System.nanoTime());
+        if (shutdownRequested) {
+            return;
+        }
+        try {
+            pollerScheduler.schedule(this::adaptivePollCycle, delay, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException stopping) {
+            // stop() shut the scheduler between the check above and this submit — nothing to do.
         }
     }
 
     /** Periodic hot-row promotion — a no-op call for NoopBacklogPromoter, real work for a throttling implementation. */
     private void promoteBacklogOnce() {
+        // Paused: do not promote either. Promotion is upstream of claiming, so letting it run while
+        // the cluster is paused would keep filling tm_in_flight from a backlog nobody is draining —
+        // for a throttling promoter that is the one thing its in-flight window exists to prevent,
+        // and the window would be full of stale reservations by the time work resumes. Mirrors the
+        // check pollOnce() opens with; a task left in tm_task is picked up on the next cycle after
+        // resume, exactly like one left QUEUED in tm_in_flight.
+        if (pauseController.isPauseRequested()) {
+            return;
+        }
         for (String taskType : taskTypes) {
             backlogPromoter.promote(taskType, Instant.now(), schedulingConfig.getBacklogBatchSize());
         }
@@ -337,6 +419,9 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
     private Runnable dispatchTask(TaskRef taskRef) {
         return () -> {
+            // Counted here, at pickup rather than completion: this is the queue's consumption
+            // rate, which is what the poller has to keep ahead of.
+            queueConsumed.incrementAndGet();
             try {
                 attempt(taskRef);
             } finally {

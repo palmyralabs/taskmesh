@@ -86,7 +86,7 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
      * {@link #claimMultiNode} plus the {@code next_retry_at} backoff gate.
      */
     @Query("SELECT new com.palmyralabs.taskmesh.api.TaskRef(f.taskType, f.taskId) FROM TmInFlightEntity f "
-            + "WHERE f.taskType = :taskType AND (f.nextRetryAt IS NULL OR f.nextRetryAt <= :now) AND ("
+            + "WHERE f.nextRetryAt <= :now AND ("
             + "     f.status IS NULL "
             + "  OR (f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.QUEUED    AND f.nodeId = :nodeId) "
             + "  OR (f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.QUEUED    AND (f.nodeId IS NULL OR f.updatedAt < :reservationCutoff)) "
@@ -96,8 +96,8 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
             + "  OR (f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.RELEASED  AND f.nodeId = :nodeId AND f.updatedAt >= :affinityCutoff) "
             + "  OR (f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.RELEASED  AND (f.updatedAt IS NULL OR f.updatedAt < :affinityCutoff)) "
             + "  OR (f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.CLAIMED   AND f.updatedAt < :claimTimeoutCutoff)"
-            + ") ORDER BY f.createdAt ASC")
-    List<TaskRef> findClaimableMultiNode(@Param("taskType") String taskType, @Param("nodeId") String nodeId,
+            + ") ORDER BY f.nextRetryAt ASC")
+    List<TaskRef> findClaimableMultiNode(@Param("nodeId") String nodeId,
                                           @Param("now") Instant now, @Param("reservationCutoff") Instant reservationCutoff,
                                           @Param("affinityCutoff") Instant affinityCutoff,
                                           @Param("claimTimeoutCutoff") Instant claimTimeoutCutoff, Pageable pageable);
@@ -114,14 +114,14 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
      * Cooperative yield (D33) — the owner hands unfinished work back while its
      * lease is still valid. Parks the row in {@code YIELDED} (its own status, so
      * the next claim knows not to bill it) reserved to the same node,
-     * drops the lease, and clears the backoff gate: no retry budget is consumed
+     * drops the lease, and opens the backoff gate (set to now, never null - the column is populated on every row so discovery can order by it): no retry budget is consumed
      * and nothing gates re-claim, so it is immediately claimable again once
      * whatever caused the yield clears. Fenced by {@code node_id} like every
      * other release.
      */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmInFlightEntity f SET f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.YIELDED, "
-            + "f.leaseExpiresAt = null, f.nextRetryAt = null, f.updatedAt = :now "
+            + "f.leaseExpiresAt = null, f.nextRetryAt = :now, f.updatedAt = :now "
             + "WHERE f.taskType = :taskType AND f.taskId = :taskId AND f.nodeId = :nodeId "
             + "AND f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.CLAIMED")
     int markYielded(@Param("taskType") String taskType, @Param("taskId") String taskId,
@@ -142,10 +142,10 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
                          @Param("nodeId") String nodeId, @Param("now") Instant now);
 
     @Query("SELECT new com.palmyralabs.taskmesh.api.TaskRef(f.taskType, f.taskId) FROM TmInFlightEntity f "
-            + "WHERE f.taskType = :taskType AND (f.status IS NULL OR f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.QUEUED "
+            + "WHERE (f.status IS NULL OR f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.QUEUED "
             + "     OR f.status = com.palmyralabs.taskmesh.pro.entity.TaskStatus.YIELDED) "
-            + "AND (f.nextRetryAt IS NULL OR f.nextRetryAt <= :now) ORDER BY f.createdAt ASC")
-    List<TaskRef> findClaimableSingleNode(@Param("taskType") String taskType, @Param("now") Instant now, Pageable pageable);
+            + "AND f.nextRetryAt <= :now ORDER BY f.nextRetryAt ASC")
+    List<TaskRef> findClaimableSingleNode(@Param("now") Instant now, Pageable pageable);
 
     /** Single-node retryable release — no affinity concept, so unclaim immediately rather than keeping RELEASED. */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
@@ -181,7 +181,7 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmInFlightEntity f SET f.status = null, f.nodeId = null, f.claimedAt = null, "
             + "f.leaseExpiresAt = null, f.attemptCount = f.attemptCount + 1, f.retryCount = -1, "
-            + "f.nextRetryAt = null, f.updatedAt = :now "
+            + "f.nextRetryAt = :now, f.updatedAt = :now "
             + "WHERE f.taskType = :taskType AND f.taskId = :taskId")
     int resetForRerun(@Param("taskType") String taskType, @Param("taskId") String taskId, @Param("now") Instant now);
 

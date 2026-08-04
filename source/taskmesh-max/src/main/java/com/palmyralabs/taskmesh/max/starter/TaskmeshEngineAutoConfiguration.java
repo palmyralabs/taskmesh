@@ -138,18 +138,22 @@ public class TaskmeshEngineAutoConfiguration {
     }
 
     /**
-     * Default is still {@link NoopBacklogPromoter} — this tier's {@code
-     * enqueue()} only writes {@code tm_task}, so Noop's {@code onEnqueue}
-     * creates the hot row immediately here (reproducing the eager-pair
-     * behavior), unlike taskmesh-simple/-pro where {@code enqueue()} itself
-     * already does that. A consumer that actually needs throttled promotion
-     * at this tier's scale supplies their own {@code JpaBacklogPromoter} bean.
+     * Selected by {@code taskmesh.backlog-promotion}, defaulting to {@code EAGER}
+     * ({@link NoopBacklogPromoter}) — this tier's {@code enqueue()} only writes
+     * {@code tm_task}, so Noop's {@code onEnqueue} creates the hot row immediately
+     * here (reproducing the eager-pair behavior), unlike taskmesh-simple/-pro where
+     * {@code enqueue()} itself already does that. {@code THROTTLED} swaps in
+     * {@code JpaBacklogPromoter} and its in-flight window. A consumer wanting
+     * something else entirely still just supplies their own bean.
      */
     @Bean
     @ConditionalOnMissingBean(BacklogPromoter.class)
-    public BacklogPromoter backlogPromoter(TmTaskRepository taskRepository, TmInFlightRepository inFlightRepository,
+    public BacklogPromoter backlogPromoter(TaskmeshProperties properties, TmTaskRepository taskRepository,
+            TmInFlightRepository inFlightRepository, @Qualifier("claimStrategy") ClaimStrategy claimStrategy,
+            NodeInfoProvider nodeInfoProvider,
             @Qualifier("taskmeshTransactionTemplate") TransactionTemplate transactionTemplate) {
-        return new NoopBacklogPromoter(taskRepository, inFlightRepository, transactionTemplate);
+        return ProfileFactories.backlogPromoter(properties, taskRepository, inFlightRepository,
+                transactionTemplate, claimStrategy, nodeInfoProvider);
     }
 
     @Bean
@@ -189,11 +193,7 @@ public class TaskmeshEngineAutoConfiguration {
                 .incidentStore(incidentStore)
                 .metricsReporter(metricsReporter)
                 .payloadProviderFactory(payloadProviderFactory)
-                .schedulingConfig(SchedulingConfig.builder()
-                        .workerPoolSize(properties.getWorkerPoolSize())
-                        .batchSize(properties.getBatchSize())
-                        .queryIntervalSeconds(properties.getQueryIntervalSeconds())
-                        .build())
+                .schedulingConfig(ProfileFactories.schedulingConfig(properties))
                 .build();
         engine.start();
         return engine;

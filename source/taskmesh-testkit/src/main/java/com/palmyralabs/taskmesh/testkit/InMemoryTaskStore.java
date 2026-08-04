@@ -9,6 +9,7 @@ import com.palmyralabs.taskmesh.api.RetryPolicy;
 import com.palmyralabs.taskmesh.api.TaskRef;
 
 import java.time.Instant;
+import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -107,20 +108,29 @@ public class InMemoryTaskStore {
         });
     }
 
-    public synchronized List<TaskRef> findClaimable(String taskType, Instant now, int limit) {
-        List<TaskRef> candidates = new ArrayList<>();
+    /**
+     * Discovery across <b>every</b> task type, oldest-visible first — mirrors the JPA tiers, where
+     * the type filter moved off the query and into the engine's registry check. Ordering is by
+     * {@code nextRetryAt} (the row's "not visible before" instant), so a task whose retry has just
+     * come due interleaves correctly with fresh work instead of jumping the whole queue.
+     */
+    public synchronized List<TaskRef> findClaimable(Instant now, int limit) {
+        List<Row> visible = new ArrayList<>();
         for (Row row : rows.values()) {
-            if (candidates.size() >= limit) {
-                break;
-            }
-            if (!row.taskRef.taskType().equals(taskType)) {
-                continue;
-            }
             if (row.status != Status.QUEUED && row.status != Status.YIELDED) {
                 continue;
             }
             if (row.nextRetryAt != null && row.nextRetryAt.isAfter(now)) {
                 continue;
+            }
+            visible.add(row);
+        }
+        // Nulls first: a row that has never been gated is visible from the moment it was created.
+        visible.sort(Comparator.comparing(row -> row.nextRetryAt, Comparator.nullsFirst(Comparator.naturalOrder())));
+        List<TaskRef> candidates = new ArrayList<>();
+        for (Row row : visible) {
+            if (candidates.size() >= limit) {
+                break;
             }
             candidates.add(row.taskRef);
         }

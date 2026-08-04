@@ -154,6 +154,7 @@ class CounterModelEngineTest {
         hotRow.setRetryCount(4);
         hotRow.setMaxRetries(Integer.MAX_VALUE);
         hotRow.setCreatedAt(now);
+            hotRow.setNextRetryAt(now);   // an externally-populated row must declare when it becomes visible
         hotRow.setUpdatedAt(now);
         inFlightRepository.save(hotRow);
 
