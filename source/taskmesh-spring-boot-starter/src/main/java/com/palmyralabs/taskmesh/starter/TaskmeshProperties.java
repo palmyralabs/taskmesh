@@ -129,4 +129,19 @@ public class TaskmeshProperties {
 
     /** Blank (default) falls back to taskmesh's DefaultNodeInfoProvider (hostname+PID). */
     private String nodeId = "";
+
+    /**
+     * When {@code false}, the {@code TaskMeshEngine} bean is still built and
+     * wired — {@code enqueue}/{@code execute}/{@code pause}/{@code rerun} all
+     * still work — but {@code engine.start()} is never called, so this node's
+     * feeder, claim loop and worker pool never run. It will not poll, claim,
+     * or execute any task, including ones enqueued from this same JVM.
+     *
+     * <p>Exists for developers pointing at a shared database: without it,
+     * every node with the app running competes to claim and execute every
+     * other node's queued work. Set {@code taskmesh.auto-start: false} in
+     * {@code application.yml} (or a profile) on any node that should observe
+     * or enqueue but never execute.
+     */
+    private boolean autoStart = true;
 }

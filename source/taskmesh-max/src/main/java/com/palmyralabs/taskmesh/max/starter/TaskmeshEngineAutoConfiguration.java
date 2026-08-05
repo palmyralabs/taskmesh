@@ -43,6 +43,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import lombok.extern.slf4j.Slf4j;
+
 import java.time.Duration;
 import java.util.List;
 
@@ -61,6 +63,7 @@ import java.util.List;
 @AutoConfiguration(after = TaskmeshJpaAutoConfiguration.class)
 @EnableConfigurationProperties(TaskmeshProperties.class)
 @ConditionalOnBean(TmTaskRepository.class)
+@Slf4j
 public class TaskmeshEngineAutoConfiguration {
 
     @Bean
@@ -195,7 +198,12 @@ public class TaskmeshEngineAutoConfiguration {
                 .payloadProviderFactory(payloadProviderFactory)
                 .schedulingConfig(ProfileFactories.schedulingConfig(properties))
                 .build();
-        engine.start();
+        if (properties.isAutoStart()) {
+            engine.start();
+        } else {
+            log.info("taskmesh.auto-start=false — engine wired but not started on this node; "
+                    + "it will not poll, claim or execute any task");
+        }
         return engine;
     }
 }
