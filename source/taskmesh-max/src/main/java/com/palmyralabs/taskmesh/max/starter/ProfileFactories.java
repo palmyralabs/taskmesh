@@ -84,7 +84,9 @@ final class ProfileFactories {
             // owns the eligibility windows the in-flight window is measured against.
             case THROTTLED -> new JpaBacklogPromoter(taskRepository, inFlightRepository, transactionTemplate,
                     (PartitionedTaskLedger) claimStrategy, nodeInfoProvider.nodeId(),
-                    properties.getInFlightLowWatermark(), properties.getInFlightHighWatermark());
+                    properties.getInFlightLowWatermark(), properties.getInFlightHighWatermark(),
+                    properties.isAdaptiveInFlightWindow(), properties.getBacklogIntervalSeconds(),
+                    Math.max(1, properties.getQueueCapacity() - SchedulingConfig.PRIORITY_QUEUE_CAPACITY));
         };
     }
 

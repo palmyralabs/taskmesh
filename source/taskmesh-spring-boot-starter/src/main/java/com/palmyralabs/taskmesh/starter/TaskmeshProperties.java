@@ -113,6 +113,14 @@ public class TaskmeshProperties {
      * Must cover {@code inFlightHighWatermark - inFlightLowWatermark} or a refill
      * takes several cycles and the watermark sizing above stops holding.
      */
+    /**
+     * Re-derive the in-flight window every promotion cycle from what the node is actually
+     * consuming, instead of holding {@link #inFlightLowWatermark}/{@link #inFlightHighWatermark}
+     * fixed. When on, those two become the floor and ceiling of the derived window rather than the
+     * window itself, and seed it until two consumption samples exist. THROTTLED promotion only.
+     */
+    private boolean adaptiveInFlightWindow = true;
+
     private int backlogBatchSize = 1500;
     private int backlogIntervalSeconds = 5;
 

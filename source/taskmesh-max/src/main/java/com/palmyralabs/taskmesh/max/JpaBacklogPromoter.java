@@ -118,6 +118,11 @@ public class JpaBacklogPromoter implements BacklogPromoter {
     private final int lowWatermark;
     /** Never promote past this level in one cycle. */
     private final int highWatermark;
+    /**
+     * When non-null, the window is derived from observed consumption each cycle and the two
+     * watermarks above act only as its floor and ceiling. Null keeps them fixed.
+     */
+    private final InFlightWindow window;
     private final AtomicBoolean undersizedBatchWarned = new AtomicBoolean();
 
     /**
@@ -129,6 +134,21 @@ public class JpaBacklogPromoter implements BacklogPromoter {
     public JpaBacklogPromoter(TmTaskRepository taskRepository, TmInFlightRepository inFlightRepository,
                                TransactionTemplate transactionTemplate, PartitionedTaskLedger taskLedger, String nodeId,
                                int lowWatermark, int highWatermark) {
+        this(taskRepository, inFlightRepository, transactionTemplate, taskLedger, nodeId,
+                lowWatermark, highWatermark, false, 5, 95);
+    }
+
+    /**
+     * @param adaptiveWindow when true the window is re-derived every cycle from observed
+     *                       consumption ({@link InFlightWindow}) and the two watermarks become its
+     *                       floor and ceiling rather than the window itself
+     * @param promotionIntervalSeconds the promoter's own schedule, which is what turns an observed
+     *                       consumption <i>rate</i> into rows-per-cycle
+     */
+    public JpaBacklogPromoter(TmTaskRepository taskRepository, TmInFlightRepository inFlightRepository,
+                               TransactionTemplate transactionTemplate, PartitionedTaskLedger taskLedger, String nodeId,
+                               int lowWatermark, int highWatermark,
+                               boolean adaptiveWindow, long promotionIntervalSeconds, int regularQueueCapacity) {
         if (lowWatermark <= 0) {
             throw new IllegalArgumentException("lowWatermark must be positive, was " + lowWatermark);
         }
@@ -143,6 +163,9 @@ public class JpaBacklogPromoter implements BacklogPromoter {
         this.nodeId = nodeId;
         this.lowWatermark = lowWatermark;
         this.highWatermark = highWatermark;
+        this.window = adaptiveWindow
+                ? new InFlightWindow(lowWatermark, highWatermark, promotionIntervalSeconds, regularQueueCapacity, nodeId)
+                : null;
     }
 
     @Override
@@ -194,10 +217,19 @@ public class JpaBacklogPromoter implements BacklogPromoter {
             // towards its window. An unpaginated COUNT, not a page size: the level has to be the
             // real one, and a count capped at the window could never report an overshoot.
             long claimable = taskLedger.countClaimable(now);
-            if (claimable >= lowWatermark) {
+            int low = lowWatermark;
+            int high = highWatermark;
+            if (window != null) {
+                // Adaptive: size the window from what this node is actually consuming, and let the
+                // configured watermarks act as floor and ceiling. See InFlightWindow.
+                window.observe(claimable, System.nanoTime());
+                low = window.low();
+                high = window.high();
+            }
+            if (claimable >= low) {
                 return 0;   // still inside the window — nothing to do this cycle
             }
-            int batch = (int) Math.min(limit, highWatermark - claimable);
+            int batch = (int) Math.min(limit, high - claimable);
             if (batch <= 0) {
                 return 0;
             }
@@ -218,33 +250,24 @@ public class JpaBacklogPromoter implements BacklogPromoter {
                 return 0;
             }
 
-            // Only the rows this call actually stamped — a partially-won slice must not create hot
-            // rows for a peer's share.
-            List<TmTaskEntity> mine = taskRepository.findPromotedAt(taskType, candidateIds, now);
-            for (TmTaskEntity task : mine) {
-                // Same guard NoopBacklogPromoter carries, for the same reason: save() on a
-                // manually-assigned composite key is an upsert, not insert-or-throw, so an
-                // unguarded save over an existing hot row silently resets a claimed task to
-                // unclaimed and loses the current owner's claim. Winning the stamp above now makes
-                // that near-impossible, but "near-impossible" is exactly how the last one presented.
-                if (inFlightRepository.findById(new TaskId(task.getTaskType(), task.getTaskId())).isPresent()) {
-                    continue;
-                }
-                // Seeded from the cold row's attempt_count + 1 (see TaskLedger#rerun) — always 1 in
-                // practice here too, since a backlogged task by definition has no hot row yet.
-                // retry_count starts at -1 (the first claim bills it to 0): a new attempt always restarts the inner counter (D33).
-                //
-                // Reserved to THIS node, deliberately: the window is measured per node
-                // (countClaimable is node-scoped), so each node promotes and owns its own working
-                // set. That is what gives every node its own 1500..3000 of available work and means
-                // a node only ever claims rows reserved to itself — no cross-node claim contention
-                // at all. The reservation window still lets a peer steal the set if this node dies.
-                TmInFlightEntity hot = TmTaskEntities.newReservedRow(
-                        new TaskRef(task.getTaskType(), task.getTaskId(), task.getPartitionKey()), nodeId,
-                        task.getAttemptCount() + 1, TmTaskEntities.NO_EXECUTION_YET);
-                inFlightRepository.save(hot);
+            // One set-based INSERT ... SELECT for the whole slice, scoped to the rows this call
+            // stamped — a partially-won slice must not create hot rows for a peer's share. This
+            // used to be a per-row loop costing ~3N+4 statements; it is now exactly one, so a
+            // 500-row batch no longer floods the same connections the drain is using.
+            //
+            // Rows are reserved to THIS node deliberately: the window is measured per node
+            // (countClaimable is node-scoped), so each node promotes and owns its own working set.
+            // That is what gives every node its own low..high of available work, and means a node
+            // only ever claims rows reserved to itself — no cross-node claim contention at all.
+            // The reservation window still lets a peer steal the set if this node dies.
+            int inserted = inFlightRepository.insertPromotedSlice(taskType, candidateIds, now, nodeId,
+                    TmTaskEntities.UNBOUNDED_MAX_RETRIES);
+            if (window != null) {
+                // The window has to know what we added, or the next cycle reads our own promotion
+                // as consumption and the rate estimate runs away.
+                window.promoted(inserted);
             }
-            return mine.size();
+            return inserted;
         });
         return promoted == null ? 0 : promoted;
     }

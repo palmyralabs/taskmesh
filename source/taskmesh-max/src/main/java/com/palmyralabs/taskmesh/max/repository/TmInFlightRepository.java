@@ -168,6 +168,45 @@ public interface TmInFlightRepository extends JpaRepository<TmInFlightEntity, Ta
     List<Object[]> countByTaskType(@Param("taskType") String taskType);
 
     /**
+     * Creates the hot rows for one promoted slice in <b>a single statement</b>, reading straight
+     * from the cold rows this promoter just stamped.
+     *
+     * <p>Replaces a per-row loop that cost roughly {@code 3N + 4} statements: a {@code findById}
+     * guard, plus a {@code save()} which — because {@code tm_in_flight} has an assigned composite
+     * key and so never looks "new" to Spring Data — became a {@code merge()}, i.e. another SELECT
+     * and then the INSERT. At a 500-row batch that was ~1,500 statements every promotion cycle,
+     * running against the same connections and the same database as the drain it was feeding.
+     * Measured cost: throttled promotion ran ~25% below eager at 64 workers/node.
+     *
+     * <p>{@code NOT EXISTS} does set-wise what the per-row guard did one row at a time, and for the
+     * same reason: {@code save()} on an assigned key is an upsert, so writing over a live hot row
+     * would silently reset a claimed task to unclaimed and lose its owner's claim. Kept even though
+     * winning {@code stampPromoted} makes a collision nearly impossible — "nearly impossible" is
+     * how the last one presented.
+     *
+     * <p>Native rather than JPQL: JPQL has no {@code INSERT ... SELECT}. The syntax here is plain
+     * standard SQL, so it runs unchanged on both Postgres and the H2 the tests use.
+     *
+     * @param now the exact instant {@code stampPromoted} wrote, which identifies this call's slice
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = "INSERT INTO tm_in_flight (task_type, task_id, partition_key, status, node_id, "
+            + "attempt_count, retry_count, max_retries, next_retry_at, created_at, updated_at) "
+            // attempt_count seeded from the cold row + 1 and retry_count at -1, exactly as
+            // TmTaskEntities.newReservedRow does: a new attempt restarts the inner counter, and the
+            // first claim bills it up to 0 (D33).
+            + "SELECT t.task_type, t.task_id, t.partition_key, 'QUEUED', :nodeId, "
+            + "t.attempt_count + 1, -1, :maxRetries, :now, :now, :now "
+            + "FROM tm_task t "
+            + "WHERE t.task_type = :taskType AND t.task_id IN :taskIds AND t.promoted_at = :now "
+            + "AND NOT EXISTS (SELECT 1 FROM tm_in_flight f "
+            + "                WHERE f.task_type = t.task_type AND f.task_id = t.task_id)",
+            nativeQuery = true)
+    int insertPromotedSlice(@Param("taskType") String taskType, @Param("taskIds") List<String> taskIds,
+                             @Param("now") Instant now, @Param("nodeId") String nodeId,
+                             @Param("maxRetries") int maxRetries);
+
+    /**
      * How much claimable work this node has right now, across <b>every</b> task type — the
      * in-flight level {@link com.palmyralabs.taskmesh.max.JpaBacklogPromoter} regulates against.
      *

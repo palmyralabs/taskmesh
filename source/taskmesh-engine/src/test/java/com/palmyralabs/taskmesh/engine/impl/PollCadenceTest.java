@@ -132,6 +132,29 @@ class PollCadenceTest {
         assertTrue(afterStall < 600_000, "a single stall must not jump straight to the ceiling");
     }
 
+    /**
+     * A slowing workload moves the cadence in EWMA-sized steps, none of them a doubling — a real
+     * 10k run drifted from 1s to roughly 8s over four minutes that way. The cadence must still
+     * follow it; only the logging threshold treats drift differently from a jump.
+     */
+    @Test
+    void aWorkloadThatSlowsGraduallyIsStillTracked() {
+        PollCadence cadence = cadence(1_000, 600_000);
+        settleAt(cadence, 135);   // the burst rate the paused enqueue phase produces
+        assertEquals(1_000, cadence.currentDelayMillis(), "precondition: fast, so pinned at the floor");
+
+        // Now the real workload: ~15 tasks/s per node, as a 0-1000ms random processor produces.
+        long consumed = 135L * 40;
+        long delay = 0;
+        for (int second = 41; second <= 120; second++) {
+            consumed += 15;
+            delay = cadence.nextDelayMillis(consumed, second * SECOND);
+        }
+
+        assertTrue(delay >= 7_000 && delay <= 10_000,
+                "0.5 x 251 / 15 is ~8.4s; the cadence should have followed the slowdown, got " + delay);
+    }
+
     // ---- hard bounds, not overridable ------------------------------------------
 
     @Test

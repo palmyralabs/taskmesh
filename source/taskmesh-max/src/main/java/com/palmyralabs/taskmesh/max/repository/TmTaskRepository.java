@@ -100,24 +100,13 @@ public interface TmTaskRepository extends JpaRepository<TmTaskEntity, Partitione
      * snapshot, and updates 0 rows — the same "0 rows affected = lost the race" contract the claim
      * UPDATE uses, so the loser simply takes the next slice on its following cycle.
      *
-     * <p>Pair with {@link #findPromotedAt} to recover exactly which rows this call won.
+     * <p>The {@code now} written here doubles as the slice's marker: it carries microsecond
+     * precision and is supplied by the caller, so
+     * {@code TmInFlightRepository.insertPromotedSlice} can select exactly the rows this call won
+     * by matching on it, without a second round trip per row.
      */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE TmTaskEntity t SET t.promotedAt = :now "
             + "WHERE t.taskType = :taskType AND t.taskId IN :taskIds AND t.promotedAt IS NULL")
     int stampPromoted(@Param("taskType") String taskType, @Param("taskIds") List<String> taskIds, @Param("now") Instant now);
-
-    /**
-     * The rows a given {@link #stampPromoted} call actually won — matched on the exact
-     * {@code promoted_at} instant it wrote.
-     *
-     * <p>A row count alone is not enough: a partially-won slice has to create hot rows for the rows
-     * this promoter took and no others. {@code promoted_at} carries microsecond precision and is
-     * supplied by the caller, so it doubles as that call's marker; two promoters colliding on the
-     * identical instant would both have had to win the same guarded UPDATE, which cannot happen.
-     */
-    @Query("SELECT t FROM TmTaskEntity t WHERE t.taskType = :taskType AND t.taskId IN :taskIds "
-            + "AND t.promotedAt = :promotedAt")
-    List<TmTaskEntity> findPromotedAt(@Param("taskType") String taskType, @Param("taskIds") List<String> taskIds,
-                                       @Param("promotedAt") Instant promotedAt);
 }

@@ -76,6 +76,8 @@ final class PollCadence {
     private long lastSampleNanos;
     private long lastSampleCount;
     private long currentDelayMillis;
+    /** The last delay actually logged — the baseline "material change" is measured from. */
+    private long lastLoggedDelayMillis;
 
     PollCadence(SchedulingConfig config, int regularCapacity, String nodeId) {
         long max = config.getPollMaxMillis() > 0
@@ -90,6 +92,7 @@ final class PollCadence {
         this.regularCapacity = Math.max(1, regularCapacity);
         this.nodeId = nodeId;
         this.currentDelayMillis = this.minDelayMillis;
+        this.lastLoggedDelayMillis = this.minDelayMillis;
     }
 
     /** Establishes the baseline the first interval is measured against. */
@@ -126,12 +129,17 @@ final class PollCadence {
         delay = Math.max(minDelayMillis, Math.min(maxDelayMillis, delay));
 
         // Silence is a bug: throughput that changed because the cadence moved is undiagnosable
-        // after the fact. Logged only on a material change, so a steady system stays quiet.
-        // The comparison is >= deliberately: a backoff step is exactly BACKOFF_GROWTH, so a
-        // strict > would make the entire idle ramp invisible — the one sequence most worth seeing.
-        if (delay >= currentDelayMillis * 2 || delay * 2 <= currentDelayMillis) {
+        // after the fact. Logged only on a material move, so a steady system stays quiet.
+        //
+        // Compared against the last *logged* delay, not the previous cycle. The EWMA walks the
+        // cadence in small steps — a real run drifted 1s to ~8s over four minutes without any
+        // single step reaching 2x — so a per-cycle comparison sees jumps and is blind to drift,
+        // which is now the common case since backoff became rate-limited. The comparison is >=
+        // because a backoff step is exactly BACKOFF_GROWTH, and a strict > would hide the idle ramp.
+        if (delay >= lastLoggedDelayMillis * 2 || delay * 2 <= lastLoggedDelayMillis) {
             log.info("taskmesh poll cadence {}ms -> {}ms on node {} (drain {} tasks/s, regular queue {})",
-                    currentDelayMillis, delay, nodeId, Math.round(drainRatePerSecond), regularCapacity);
+                    lastLoggedDelayMillis, delay, nodeId, Math.round(drainRatePerSecond), regularCapacity);
+            lastLoggedDelayMillis = delay;
         }
         currentDelayMillis = delay;
         return delay;
