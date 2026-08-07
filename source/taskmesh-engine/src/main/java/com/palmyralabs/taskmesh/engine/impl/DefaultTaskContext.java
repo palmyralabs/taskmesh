@@ -10,6 +10,7 @@ import com.palmyralabs.taskmesh.api.RenewOutcome;
 import com.palmyralabs.taskmesh.api.TaskContext;
 import com.palmyralabs.taskmesh.api.TaskRef;
 import com.palmyralabs.taskmesh.api.TransactionRunner;
+import com.palmyralabs.taskmesh.exception.NonRetryableException;
 
 import java.util.function.BooleanSupplier;
 
@@ -75,6 +76,13 @@ class DefaultTaskContext implements TaskContext {
         if (!payloadLoaded) {
             try {
                 payload = payloadProvider.load(taskRef);
+            } catch (NonRetryableException e) {
+                // Preserve identity: FailureClassifier pattern-matches on the
+                // exception type it receives, not its cause chain. Wrapping
+                // this in PayloadLoadException would silently downgrade a
+                // "don't retry" signal from the payload provider into the
+                // engine's default retryable classification.
+                throw e;
             } catch (Exception e) {
                 throw new PayloadLoadException(taskRef, e);
             }
