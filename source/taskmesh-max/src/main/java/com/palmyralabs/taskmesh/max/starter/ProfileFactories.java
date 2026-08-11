@@ -100,6 +100,7 @@ final class ProfileFactories {
     static SchedulingConfig schedulingConfig(TaskmeshProperties properties) {
         return SchedulingConfig.builder()
                 .workerPoolSize(properties.getWorkerPoolSize())
+                .initialPoolSize(properties.getInitialPoolSize())
                 .batchSize(properties.getBatchSize())
                 .queryIntervalSeconds(properties.getQueryIntervalSeconds())
                 .queueCapacity(properties.getQueueCapacity())

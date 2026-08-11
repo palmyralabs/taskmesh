@@ -45,6 +45,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The driving implementation (D8/module-layout.md) of {@link TaskMeshEngine}:
@@ -104,6 +105,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     private final Object poolResizeLock = new Object();
 
     private volatile boolean shutdownRequested = false;
+    private final AtomicReference<Status> status = new AtomicReference<>(Status.STOPPED);
 
     /** Incremented as each queued task is picked up by a worker — the queue's consumption signal. */
     private final AtomicLong queueConsumed = new AtomicLong();
@@ -144,9 +146,14 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
 
     private ThreadPoolExecutor buildWorkerPool() {
         AtomicInteger threadCount = new AtomicInteger();
-        int poolSize = schedulingConfig.getWorkerPoolSize();
+        int ceiling = schedulingConfig.getWorkerPoolSize();
+        int configuredInitial = schedulingConfig.getInitialPoolSize();
+        // 0 means "start at the ceiling" — the original behavior, unchanged
+        // for every consumer that never sets initialPoolSize. Clamped to
+        // [1, ceiling], the same bound adjustPoolSize applies at runtime.
+        int initial = configuredInitial <= 0 ? ceiling : Math.max(1, Math.min(configuredInitial, ceiling));
         ThreadPoolExecutor executor = new ThreadPoolExecutor(
-                poolSize, poolSize, 60L, TimeUnit.SECONDS, executionQueue,
+                initial, ceiling, 60L, TimeUnit.SECONDS, executionQueue,
                 runnable -> {
                     Thread thread = new Thread(runnable,
                             "taskmesh-" + nodeInfoProvider.nodeId() + "-worker-" + threadCount.incrementAndGet());
@@ -164,6 +171,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     @Override
     public void start() {
         shutdownRequested = false;
+        status.set(Status.RUNNING);
         log.info("taskmesh engine starting, nodeId={}, clusterPaused={}",
                 nodeInfoProvider.nodeId(), pauseController.isPauseRequested());
         long intervalMillis = TimeUnit.SECONDS.toMillis(schedulingConfig.getQueryIntervalSeconds());
@@ -183,6 +191,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     public void stop() {
         log.info("taskmesh engine stopping, nodeId={}", nodeInfoProvider.nodeId());
         shutdownRequested = true;
+        status.set(Status.DRAINING);
         pollerScheduler.shutdownNow();
         backlogScheduler.shutdownNow();
         workerPool.shutdown();
@@ -190,7 +199,14 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
             workerPool.awaitTermination(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        } finally {
+            status.set(Status.STOPPED);
         }
+    }
+
+    @Override
+    public Status getStatus() {
+        return status.get();
     }
 
     /**

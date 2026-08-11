@@ -163,3 +163,21 @@ CREATE TABLE tm_control_flag (
 );
 -- Seed the single row (JpaPauseController will also self-seed if absent).
 INSERT INTO tm_control_flag (id, pause_requested) VALUES (1, false);
+
+-- ---- tm_node (taskmesh-pro and -max — node presence roster) -----------
+-- Added 2026-08-08 (pro), mirrored to -max the same day. One row per node
+-- that has ever heartbeat into the cluster, upserted by NodeHeartbeatWriter
+-- on a fixed interval (taskmesh.node-heartbeat-interval-minutes, default 15).
+-- Answers "which nodes exist and when did we last hear from them"
+-- independent of whether a node is actively claiming/executing a task right
+-- now — distinct from tm_in_flight.node_id, which only ever names a node
+-- while it holds a claim, and from HeartbeatStrategy, which renews a task's
+-- lease, not node presence. Identical schema across both tiers — no
+-- partition_key (D32), since this table is never partitioned. Not present
+-- under taskmesh-simple.
+CREATE TABLE tm_node (
+    node_id           VARCHAR(255) NOT NULL,
+    first_seen_at     TIMESTAMP(6) WITH TIME ZONE NOT NULL,
+    last_heartbeat_at TIMESTAMP(6) WITH TIME ZONE NOT NULL,
+    CONSTRAINT pk_tm_node PRIMARY KEY (node_id)
+);

@@ -23,6 +23,19 @@ public class SchedulingConfig {
     @Builder.Default
     private int workerPoolSize = 8;
 
+    /**
+     * Core pool size the worker pool actually starts at, before any
+     * {@code adjustPoolSize} call. 0 (the default) means "start at {@link
+     * #workerPoolSize}" — the original, unconditional-eager-start behavior,
+     * unchanged for every consumer that never sets this. A positive value
+     * lets a backpressure policy own the ramp-up from a small idle floor
+     * instead of every node prestarting its full ceiling on day one; bounded
+     * to {@code [1, workerPoolSize]} at construction, same clamp
+     * {@code adjustPoolSize} already applies at runtime.
+     */
+    @Builder.Default
+    private int initialPoolSize = 0;
+
     @Builder.Default
     private int queueCapacity = 100;
 

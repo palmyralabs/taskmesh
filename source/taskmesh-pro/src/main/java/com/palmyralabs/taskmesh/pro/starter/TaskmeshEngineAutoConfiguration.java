@@ -22,6 +22,7 @@ import com.palmyralabs.taskmesh.pro.ExponentialBackoffRetryPolicy;
 import com.palmyralabs.taskmesh.pro.JpaAuditEventSink;
 import com.palmyralabs.taskmesh.pro.JpaIncidentStore;
 import com.palmyralabs.taskmesh.pro.JpaPauseController;
+import com.palmyralabs.taskmesh.pro.NodeHeartbeatWriter;
 import com.palmyralabs.taskmesh.pro.NoopBacklogPromoter;
 import com.palmyralabs.taskmesh.pro.repository.TmAttemptHistoryRepository;
 import com.palmyralabs.taskmesh.pro.repository.TmAuditEventRepository;
@@ -29,6 +30,7 @@ import com.palmyralabs.taskmesh.pro.repository.TmControlFlagRepository;
 import com.palmyralabs.taskmesh.pro.repository.TmHistoryEventRepository;
 import com.palmyralabs.taskmesh.pro.repository.TmInFlightRepository;
 import com.palmyralabs.taskmesh.pro.repository.TmIncidentRepository;
+import com.palmyralabs.taskmesh.pro.repository.TmNodeRepository;
 import com.palmyralabs.taskmesh.pro.repository.TmTaskRepository;
 import com.palmyralabs.taskmesh.starter.SingleProviderPayloadProviderFactory;
 import com.palmyralabs.taskmesh.starter.Slf4jMetricsReporter;
@@ -37,9 +39,11 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnSingleCandidate;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -63,6 +67,7 @@ import java.util.List;
 @AutoConfiguration(after = TaskmeshJpaAutoConfiguration.class)
 @EnableConfigurationProperties(TaskmeshProperties.class)
 @ConditionalOnBean(TmTaskRepository.class)
+@EnableScheduling
 @Slf4j
 public class TaskmeshEngineAutoConfiguration {
 
@@ -161,6 +166,31 @@ public class TaskmeshEngineAutoConfiguration {
     public HistoryWriter historyWriter(TaskmeshProperties properties, TmHistoryEventRepository historyEventRepository,
             TmAttemptHistoryRepository attemptHistoryRepository) {
         return ProfileFactories.historyWriter(properties.getProfile(), historyEventRepository, attemptHistoryRepository);
+    }
+
+    /**
+     * Node-presence roster, independent of the engine itself — see {@link
+     * NodeHeartbeatWriter}'s javadoc for why this is not {@link HeartbeatStrategy}.
+     * Requires {@link TmNodeRepository} to already exist in the context (same
+     * package-scan mechanism that surfaces every other {@code Tm*Repository}
+     * here), so a consumer who has not added {@code tm_node} to their schema
+     * yet simply does not get this bean rather than failing to start.
+     *
+     * <p>Also gated on {@code taskmesh.auto-start} (default {@code true}, same
+     * flag {@link #taskMeshEngine} reads): a node with auto-start off never
+     * claims or executes any task, so it has no business appearing in the
+     * cluster's node-presence roster either — {@code tm_node} answers "which
+     * nodes are actually part of the running cluster", not "which JVMs happen
+     * to have this dependency on their classpath". Added 2026-08-08 after a
+     * dashboard-facing node showed up in {@code tm_node} despite never running
+     * the engine.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    @ConditionalOnBean(TmNodeRepository.class)
+    @ConditionalOnProperty(prefix = "taskmesh", name = "auto-start", havingValue = "true", matchIfMissing = true)
+    public NodeHeartbeatWriter nodeHeartbeatWriter(TmNodeRepository repository, NodeInfoProvider nodeInfoProvider) {
+        return new NodeHeartbeatWriter(repository, nodeInfoProvider);
     }
 
     @Bean(destroyMethod = "stop")

@@ -47,6 +47,22 @@ public interface TaskMeshEngine {
     void stop();
 
     /**
+     * Local lifecycle state — not cluster-pause-aware (see {@link #pause}),
+     * so every state here is instant/synchronous, unlike a cluster-wide
+     * pause flag which is only as fresh as this node's next DB poll.
+     */
+    enum Status {
+        /** Never started, or fully stopped — behaviorally identical: no poller, no claim loop, no worker pool consuming. */
+        STOPPED,
+        RUNNING,
+        /** {@link #stop} was called: no new tasks accepted, in-flight/queued work still draining. */
+        DRAINING
+    }
+
+    /** Current local lifecycle state. See {@link Status}. */
+    Status getStatus();
+
+    /**
      * Runtime worker-pool resize for backpressure-driven throttling (D30).
      * Bounded to {@code [1, the pool size the engine was built with]} — this
      * only lets a caller throttle down and recover, never scale past the

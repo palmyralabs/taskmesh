@@ -32,6 +32,19 @@ public class TaskmeshProperties {
     private Jitter backoffJitter = Jitter.NONE;
 
     private int workerPoolSize = 8;
+
+    /**
+     * Core pool size the worker pool starts at, before any runtime
+     * {@code adjustPoolSize} call — see {@code SchedulingConfig.initialPoolSize}.
+     * Defaults to 2 here (unlike the engine-level default of 0/"start at
+     * ceiling"): a Spring Boot consumer of this starter is expected to pair
+     * this with a backpressure policy that grows the pool as real load and
+     * latency justify it, rather than every node prestarting its full
+     * ceiling on day one regardless of whether there is any work yet.
+     * Bounded to {@code [1, workerPoolSize]}.
+     */
+    private int initialPoolSize = 2;
+
     private int batchSize = 500;
     private int queryIntervalSeconds = 10;
 
