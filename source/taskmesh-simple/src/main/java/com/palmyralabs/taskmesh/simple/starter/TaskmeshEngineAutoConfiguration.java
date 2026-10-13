@@ -4,6 +4,7 @@ import com.palmyralabs.taskmesh.simple.SpringTransactionRunner;
 import com.palmyralabs.taskmesh.api.AuditEventSink;
 import com.palmyralabs.taskmesh.api.BacklogPromoter;
 import com.palmyralabs.taskmesh.api.ClaimStrategy;
+import com.palmyralabs.taskmesh.api.FailureClassifier;
 import com.palmyralabs.taskmesh.api.HeartbeatStrategy;
 import com.palmyralabs.taskmesh.api.HistoryWriter;
 import com.palmyralabs.taskmesh.api.IncidentStore;
@@ -16,6 +17,7 @@ import com.palmyralabs.taskmesh.api.RetryPolicy;
 import com.palmyralabs.taskmesh.api.TaskLedger;
 import com.palmyralabs.taskmesh.api.TaskProcessor;
 import com.palmyralabs.taskmesh.engine.TaskMeshEngine;
+import com.palmyralabs.taskmesh.engine.impl.DefaultFailureClassifier;
 import com.palmyralabs.taskmesh.engine.impl.DefaultNodeInfoProvider;
 import com.palmyralabs.taskmesh.engine.impl.SchedulingConfig;
 import com.palmyralabs.taskmesh.simple.ExponentialBackoffRetryPolicy;
@@ -163,6 +165,21 @@ public class TaskmeshEngineAutoConfiguration {
         return ProfileFactories.historyWriter(properties.getProfile(), historyEventRepository, attemptHistoryRepository);
     }
 
+    /**
+     * The engine's failure taxonomy. Declared as a bean rather than constructed
+     * inline so an application can replace it the same way it replaces any other
+     * collaborator here -- by defining its own, which this then backs off from.
+     *
+     * <p>Not academic: an application whose classifier is never consulted has
+     * every permanent failure retried to the end of the budget, and its reason
+     * codes never reach {@code TerminalContext.reasonCode()}.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public FailureClassifier failureClassifier() {
+        return new DefaultFailureClassifier();
+    }
+
     @Bean(destroyMethod = "stop")
     @ConditionalOnMissingBean
     public TaskMeshEngine taskMeshEngine(TaskmeshProperties properties, NodeInfoProvider nodeInfoProvider,
@@ -170,7 +187,7 @@ public class TaskmeshEngineAutoConfiguration {
             @Qualifier("taskLedger") TaskLedger taskLedger, BacklogPromoter backlogPromoter,
             HeartbeatStrategy heartbeatStrategy, PauseController pauseController, HistoryWriter historyWriter,
             AuditEventSink auditEventSink, IncidentStore incidentStore, MetricsReporter metricsReporter,
-            PayloadProviderFactory payloadProviderFactory,
+            PayloadProviderFactory payloadProviderFactory, FailureClassifier failureClassifier,
             @Qualifier("taskmeshTransactionTemplate") TransactionTemplate transactionTemplate) {
         TaskMeshEngine engine = TaskMeshEngine.builder()
                 .transactionRunner(new SpringTransactionRunner(transactionTemplate))
@@ -185,6 +202,7 @@ public class TaskmeshEngineAutoConfiguration {
                 .auditEventSink(auditEventSink)
                 .incidentStore(incidentStore)
                 .metricsReporter(metricsReporter)
+                .failureClassifier(failureClassifier)
                 .payloadProviderFactory(payloadProviderFactory)
                 .schedulingConfig(SchedulingConfig.builder()
                         .workerPoolSize(properties.getWorkerPoolSize())
@@ -196,10 +214,10 @@ public class TaskmeshEngineAutoConfiguration {
                         .pollMaxMillis(properties.getPollMaxMillis())
                         .build())
                 .build();
-        if (properties.isAutoStart()) {
+        if (properties.isEnabled()) {
             engine.start();
         } else {
-            log.info("taskmesh.auto-start=false — engine wired but not started on this node; "
+            log.info("taskmesh.enabled=false — engine wired but not started on this node; "
                     + "it will not poll, claim or execute any task");
         }
         return engine;

@@ -144,7 +144,11 @@ public class TaskmeshProperties {
     private String nodeId = "";
 
     /**
-     * When {@code false}, the {@code TaskMeshEngine} bean is still built and
+     * Per-instance participation switch — one of three independent layers of
+     * taskmesh control (the other two are per-node dynamic pause/resume and
+     * the cluster-wide {@code tm_control_flag}, both read at runtime via
+     * {@code PauseController}; this one is read once, at startup). When
+     * {@code false}, the {@code TaskMeshEngine} bean is still built and
      * wired — {@code enqueue}/{@code execute}/{@code pause}/{@code rerun} all
      * still work — but {@code engine.start()} is never called, so this node's
      * feeder, claim loop and worker pool never run. It will not poll, claim,
@@ -152,9 +156,12 @@ public class TaskmeshProperties {
      *
      * <p>Exists for developers pointing at a shared database: without it,
      * every node with the app running competes to claim and execute every
-     * other node's queued work. Set {@code taskmesh.auto-start: false} in
+     * other node's queued work. Set {@code taskmesh.enabled: false} in
      * {@code application.yml} (or a profile) on any node that should observe
-     * or enqueue but never execute.
+     * or enqueue but never execute. Renamed from {@code auto-start} —
+     * "enabled" reads correctly next to the two other control layers, and
+     * "auto-start" implied a boot-time nicety rather than a hard participation
+     * gate.
      */
-    private boolean autoStart = true;
+    private boolean enabled = true;
 }

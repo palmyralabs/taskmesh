@@ -33,4 +33,14 @@ public class TmNodeEntity {
 
     @Column(name = "last_heartbeat_at", nullable = false)
     private Instant lastHeartbeatAt;
+
+    /**
+     * Per-node dynamic pause (one of three independent control layers — see
+     * {@code TaskmeshProperties.enabled} for the startup-time one and {@code
+     * tm_control_flag} for the cluster-wide one). Read by {@code
+     * JpaPauseController} alongside the cluster flag: a node treats itself as
+     * paused when either is true.
+     */
+    @Column(name = "paused", nullable = false)
+    private boolean paused;
 }

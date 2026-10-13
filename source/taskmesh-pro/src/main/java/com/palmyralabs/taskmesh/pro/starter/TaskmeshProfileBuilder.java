@@ -4,6 +4,7 @@ import com.palmyralabs.taskmesh.pro.SpringTransactionRunner;
 import com.palmyralabs.taskmesh.api.AuditEventSink;
 import com.palmyralabs.taskmesh.api.BacklogPromoter;
 import com.palmyralabs.taskmesh.api.ClaimStrategy;
+import com.palmyralabs.taskmesh.api.FailureClassifier;
 import com.palmyralabs.taskmesh.api.HeartbeatStrategy;
 import com.palmyralabs.taskmesh.api.HistoryWriter;
 import com.palmyralabs.taskmesh.api.IncidentStore;
@@ -15,6 +16,7 @@ import com.palmyralabs.taskmesh.api.RetryPolicy;
 import com.palmyralabs.taskmesh.api.TaskLedger;
 import com.palmyralabs.taskmesh.api.TaskProcessor;
 import com.palmyralabs.taskmesh.engine.TaskMeshEngine;
+import com.palmyralabs.taskmesh.engine.impl.DefaultFailureClassifier;
 import com.palmyralabs.taskmesh.engine.impl.DefaultNodeInfoProvider;
 import com.palmyralabs.taskmesh.engine.impl.SchedulingConfig;
 import com.palmyralabs.taskmesh.pro.ExponentialBackoffRetryPolicy;
@@ -72,6 +74,7 @@ public final class TaskmeshProfileBuilder {
     private AuditEventSink auditEventSinkOverride;
     private IncidentStore incidentStoreOverride;
     private BacklogPromoter backlogPromoterOverride;
+    private FailureClassifier failureClassifierOverride;
 
     private TaskmeshProfileBuilder(WorkloadProfile profile) {
         this.profile = profile;
@@ -186,6 +189,21 @@ public final class TaskmeshProfileBuilder {
         return this;
     }
 
+    /**
+     * Replaces {@link DefaultFailureClassifier}, whose verdict is "anything that
+     * is not a {@link com.palmyralabs.taskmesh.exception.NonRetryableException} is
+     * retryable, reason code taken from the exception's class name".
+     *
+     * <p>An application with its own failure taxonomy needs this: without it, a
+     * failure it has classified as permanent is retried to the end of the budget
+     * anyway, and its reason codes never reach {@code TerminalContext.reasonCode()}
+     * -- so {@code onTerminal} sees a class name where it expected a code.
+     */
+    public TaskmeshProfileBuilder failureClassifier(FailureClassifier failureClassifier) {
+        this.failureClassifierOverride = failureClassifier;
+        return this;
+    }
+
     public TaskMeshEngine build() {
         Objects.requireNonNull(taskRepository, "taskRepository is required");
         Objects.requireNonNull(inFlightRepository, "inFlightRepository is required");
@@ -206,6 +224,8 @@ public final class TaskmeshProfileBuilder {
                         Duration.ofMinutes(properties.getBackoffBaseMinutes()), Duration.ofMinutes(properties.getBackoffCapMinutes()),
                         properties.getBackoffJitter());
         MetricsReporter resolvedMetricsReporter = metricsReporter != null ? metricsReporter : new Slf4jMetricsReporter();
+        FailureClassifier resolvedFailureClassifier = failureClassifierOverride != null ? failureClassifierOverride
+                : new DefaultFailureClassifier();
         IncidentStore resolvedIncidentStore = incidentStoreOverride != null ? incidentStoreOverride
                 : new JpaIncidentStore(incidentRepository);
         AuditEventSink resolvedAuditEventSink = auditEventSinkOverride != null ? auditEventSinkOverride
@@ -237,6 +257,7 @@ public final class TaskmeshProfileBuilder {
                 .auditEventSink(resolvedAuditEventSink)
                 .incidentStore(resolvedIncidentStore)
                 .metricsReporter(resolvedMetricsReporter)
+                .failureClassifier(resolvedFailureClassifier)
                 .payloadProviderFactory(payloadProviderFactory)
                 .schedulingConfig(SchedulingConfig.builder()
                         .workerPoolSize(properties.getWorkerPoolSize())

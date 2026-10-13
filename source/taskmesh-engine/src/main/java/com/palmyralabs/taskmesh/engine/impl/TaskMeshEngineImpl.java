@@ -172,6 +172,9 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
     public void start() {
         shutdownRequested = false;
         status.set(Status.RUNNING);
+        // Before the log line below, which reads isPauseRequested(): implementations that poll a
+        // backing store (JpaPauseController) only populate their cache once started.
+        pauseController.start();
         log.info("taskmesh engine starting, nodeId={}, clusterPaused={}",
                 nodeInfoProvider.nodeId(), pauseController.isPauseRequested());
         long intervalMillis = TimeUnit.SECONDS.toMillis(schedulingConfig.getQueryIntervalSeconds());
@@ -200,6 +203,7 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
+            pauseController.stop();
             status.set(Status.STOPPED);
         }
     }
