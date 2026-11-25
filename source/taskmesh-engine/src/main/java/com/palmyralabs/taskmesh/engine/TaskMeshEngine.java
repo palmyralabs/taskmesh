@@ -75,6 +75,22 @@ public interface TaskMeshEngine {
     /** Current core pool size — reflects the effect of {@link #adjustPoolSize}. */
     int currentPoolSize();
 
+    /**
+     * Tasks this node has accepted and queued in memory, waiting for a worker
+     * thread. In-process only, no database access: tasks waiting out a retry
+     * backoff stay in the store until the poller fetches them, so they are not
+     * counted here. Together with {@link #activeTaskCount()} this is the local
+     * load signal a backpressure caller can read cheaply on every check.
+     */
+    int queuedTaskCount();
+
+    /**
+     * Worker threads currently executing a task (an approximation, as
+     * {@link java.util.concurrent.ThreadPoolExecutor#getActiveCount()} is).
+     * In-process only, no database access.
+     */
+    int activeTaskCount();
+
     /** Operator-triggered pause — the one case AuditEventSink is written to (never for routine transitions). */
     void pause(String performedBy);
 

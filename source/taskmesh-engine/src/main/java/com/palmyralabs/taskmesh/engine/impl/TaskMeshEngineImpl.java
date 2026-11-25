@@ -244,6 +244,16 @@ public class TaskMeshEngineImpl implements TaskMeshEngine {
         return workerPool.getCorePoolSize();
     }
 
+    @Override
+    public int queuedTaskCount() {
+        return executionQueue.size();
+    }
+
+    @Override
+    public int activeTaskCount() {
+        return workerPool.getActiveCount();
+    }
+
     /** Operator-triggered pause — the one case AuditEventSink is written to (never for routine transitions). */
     @Override
     public void pause(String performedBy) {

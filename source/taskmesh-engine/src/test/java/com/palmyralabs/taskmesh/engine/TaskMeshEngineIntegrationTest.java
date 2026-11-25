@@ -231,6 +231,71 @@ class TaskMeshEngineIntegrationTest {
         assertEquals(1, engine.currentPoolSize());
     }
 
+    @Test
+    void queuedAndActiveTaskCountsReflectInMemoryLoad() throws Exception {
+        NodeInfoProvider nodeInfoProvider = () -> "node-1";
+        InMemoryTaskStore store = new InMemoryTaskStore();
+        InMemoryClaimStrategy claimStrategy = new InMemoryClaimStrategy(
+                store, nodeInfoProvider, new FixedDelayRetryPolicy(3, Duration.ofMillis(10)));
+        InMemoryPayloadStore payloadStore = new InMemoryPayloadStore();
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger finished = new AtomicInteger();
+
+        TaskProcessor processor = new TaskProcessor() {
+            @Override
+            public String taskType() {
+                return "BLOCK";
+            }
+
+            @Override
+            public void process(TaskContext ctx) {
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                finished.incrementAndGet();
+            }
+        };
+
+        TaskMeshEngine engine = TaskMeshEngine.builder()
+                .nodeInfoProvider(nodeInfoProvider)
+                .processors(List.of(processor))
+                .claimStrategy(claimStrategy)
+                .heartbeatStrategy(new InMemoryHeartbeatStrategy(claimStrategy))
+                .taskLedger(new InMemoryTaskLedger(store))
+                .backlogPromoter(new InMemoryBacklogPromoter())
+                .pauseController(new InMemoryPauseController())
+                .historyWriter(new InMemoryHistoryWriter())
+                .auditEventSink(new InMemoryAuditEventSink())
+                .incidentStore(new InMemoryIncidentStore())
+                .metricsReporter(new InMemoryMetricsReporter())
+                .payloadProviderFactory(new SingleProviderPayloadProviderFactory(payloadStore))
+                .schedulingConfig(SchedulingConfig.builder().workerPoolSize(1).queryIntervalSeconds(1).build())
+                .build();
+
+        engine.start();
+        try {
+            // settle first: right after start() a worker can briefly report busy
+            waitUntil(() -> engine.activeTaskCount() == 0 && engine.queuedTaskCount() == 0);
+
+            for (int i = 1; i <= 3; i++) {
+                TaskRef ref = new TaskRef("BLOCK", "t" + i);
+                payloadStore.store(ref, new GreetingPayload("x"));
+                engine.enqueue(ref);
+            }
+            // one worker thread: the first task runs and blocks, the other two wait in memory
+            waitUntil(() -> engine.activeTaskCount() == 1 && engine.queuedTaskCount() == 2);
+
+            release.countDown();
+            waitUntil(() -> finished.get() == 3);
+            waitUntil(() -> engine.activeTaskCount() == 0 && engine.queuedTaskCount() == 0);
+        } finally {
+            release.countDown();
+            engine.stop();
+        }
+    }
+
     /**
      * Promotion is upstream of claiming, so a paused cluster must not keep creating
      * hot rows either. Without the check in {@code promoteBacklogOnce()}, a throttling
